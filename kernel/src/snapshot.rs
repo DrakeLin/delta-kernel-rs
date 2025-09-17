@@ -1160,7 +1160,7 @@ mod tests {
 
         // Create initial commit
         let commit0 = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":7,"writerFeatures":["inCommitTimestamp"]}}
-{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableInCommitTimestamps":"true","delta.enableInCommitTimestamps.enablementVersion":"1","delta.enableInCommitTimestamps.enablementTimestamp":"1587968586154"},"createdTime":1587968586154}}"#;
+{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableInCommitTimestamps":"true","delta.inCommitTimestampEnablementVersion":"1","delta.inCommitTimestampEnablementTimestamp":"1587968586154"},"createdTime":1587968586154}}"#;
         add_commit(store.as_ref(), 0, commit0.to_string()).await?;
 
         // Create commit with ICT enabled
@@ -1194,7 +1194,7 @@ mod tests {
 
         // Create commit that enables ICT (version 1 = enablement version)
         let commit1 = r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":7,"writerFeatures":["inCommitTimestamp"]}}
-{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableInCommitTimestamps":"true","delta.enableInCommitTimestamps.enablementVersion":"1","delta.enableInCommitTimestamps.enablementTimestamp":"1587968586200"},"createdTime":1587968586154}}"#;
+{"metaData":{"id":"testId","format":{"provider":"parquet","options":{}},"schemaString":"{\"type\":\"struct\",\"fields\":[{\"name\":\"value\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}]}","partitionColumns":[],"configuration":{"delta.enableInCommitTimestamps":"true","delta.inCommitTimestampEnablementVersion":"1","delta.inCommitTimestampEnablementTimestamp":"1587968586200"},"createdTime":1587968586154}}"#;
         add_commit(store.as_ref(), 1, commit1.to_string()).await?;
 
         // Read snapshot at version 0 (before ICT enablement)

@@ -474,7 +474,7 @@ mod tests {
         ]));
         let partition_cols = ["date".to_string()];
         let state_info =
-            StateInfo::try_new(schema.as_ref(), &partition_cols, ColumnMappingMode::None).unwrap();
+            StateInfo::try_new(schema.clone(), &partition_cols, ColumnMappingMode::None).unwrap();
         let static_transform = Some(Arc::new(get_transform_spec(&state_info.all_fields)));
         let batch = vec![add_batch_with_partition_col()];
         let iter = scan_action_iter(

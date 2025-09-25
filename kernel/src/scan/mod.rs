@@ -29,7 +29,7 @@ use crate::schema::{
 };
 use crate::snapshot::SnapshotRef;
 use crate::table_features::ColumnMappingMode;
-use crate::transforms::{get_transform_spec, ColumnType};
+use crate::transforms::{get_transform_spec, ColumnType, TransformSpec};
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, Version};
 
 use self::log_replay::scan_action_iter;
@@ -117,20 +117,20 @@ impl ScanBuilder {
         // if no schema is provided, use snapshot's entire schema (e.g. SELECT *)
         let logical_schema = self.schema.unwrap_or_else(|| self.snapshot.schema());
         let state_info = StateInfo::try_new(
-            logical_schema.as_ref(),
+            logical_schema.clone(),
             &self.snapshot.metadata().partition_columns,
             self.snapshot.table_configuration().column_mapping_mode(),
         )?;
 
         let physical_predicate = match self.predicate {
-            Some(predicate) => PhysicalPredicate::try_new(&predicate, &logical_schema)?,
+            Some(predicate) => PhysicalPredicate::try_new(&predicate, &state_info.logical_schema)?,
             None => PhysicalPredicate::None,
         };
 
         Ok(Scan {
             snapshot: self.snapshot,
-            logical_schema,
-            physical_schema: Arc::new(StructType::try_new(state_info.read_fields)?),
+            logical_schema: state_info.logical_schema.clone(),
+            physical_schema: state_info.physical_schema.clone(),
             physical_predicate,
             all_fields: Arc::new(state_info.all_fields),
             have_partition_cols: state_info.have_partition_cols,
@@ -766,19 +766,23 @@ pub fn scan_row_schema() -> SchemaRef {
 }
 
 /// All the state needed to process a scan.
-struct StateInfo {
+pub(crate) struct StateInfo {
+    /// The logical schema for the scan output
+    pub(crate) logical_schema: SchemaRef,
+    /// The physical schema for reading parquet files
+    pub(crate) physical_schema: SchemaRef,
+    /// The transform specification (if any transformations are needed)
+    pub(crate) transform_spec: Option<Arc<TransformSpec>>,
     /// All fields referenced by the query.
-    all_fields: Vec<ColumnType>,
-    /// The physical (parquet) read schema to use.
-    read_fields: Vec<StructField>,
+    pub(crate) all_fields: Vec<ColumnType>,
     /// True if this query references any partition columns.
-    have_partition_cols: bool,
+    pub(crate) have_partition_cols: bool,
 }
 
 impl StateInfo {
     /// Get the state needed to process a scan.
-    fn try_new(
-        logical_schema: &Schema,
+    pub(crate) fn try_new(
+        logical_schema: SchemaRef,
         partition_columns: &[String],
         column_mapping_mode: ColumnMappingMode,
     ) -> DeltaResult<Self> {
@@ -789,7 +793,7 @@ impl StateInfo {
         // Loop over all selected fields and note if they are columns that will be read from the
         // parquet file ([`ColumnType::Selected`]) or if they are partition columns and will need to
         // be filled in by evaluating an expression ([`ColumnType::MetadataDerivedColumn`])
-        let all_fields = logical_schema
+        let all_fields: Vec<ColumnType> = logical_schema
             .fields()
             .enumerate()
             .map(|(index, logical_field)| -> DeltaResult<_> {
@@ -833,9 +837,20 @@ impl StateInfo {
             }
         }
 
+        // Build transform spec if needed
+        let transform_spec = if have_partition_cols || column_mapping_mode != ColumnMappingMode::None {
+            Some(Arc::new(get_transform_spec(&all_fields)))
+        } else {
+            None
+        };
+
+        let physical_schema = Arc::new(StructType::try_new(read_fields)?);
+
         Ok(StateInfo {
+            logical_schema,
+            physical_schema,
+            transform_spec,
             all_fields,
-            read_fields,
             have_partition_cols,
         })
     }

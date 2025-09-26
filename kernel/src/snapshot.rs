@@ -18,7 +18,7 @@ use crate::table_features::ColumnMappingMode;
 use crate::table_properties::TableProperties;
 use crate::transaction::Transaction;
 use crate::LogCompactionWriter;
-use crate::{DeltaResult, Engine, Error, ParsedLogPath, Version};
+use crate::{DeltaResult, Engine, Error, Version};
 use delta_kernel_derive::internal_api;
 
 mod builder;
@@ -389,26 +389,31 @@ impl Snapshot {
     ///
     /// ## Path Resolution Strategy
     ///
-    /// Uses a two-stage fallback approach to handle both catalog-managed and regular tables:
-    /// 1. **Log segment lookup**: Check if commit file exists in `log_segment.ascending_commit_files`
-    ///    - Uses actual physical file locations from storage layer
-    ///
-    /// 2. **Direct path construction**: If commit not found in log segment, construct path from table_root
-    ///    - Handles checkpoint-only scenarios where commits are filtered out or cleaned up
-    ///    - May fail if commit file was deleted after checkpointing (ICT becomes unavailable)
+    /// Looks up commit file in `log_segment.ascending_commit_files` using actual physical file locations
+    /// from the storage layer. Following the "Require Latest Commit" decision for ICT correctness,
+    /// this method will error if the commit file is not found in the log segment for ICT-enabled tables.
+    /// This behavior aligns with Java Kernel and Delta Spark implementations.
     ///
     /// Returns:
     /// - `Ok(Some(timestamp))` if ICT is enabled and available for this snapshot
-    /// - `Ok(None)` if ICT is not enabled for this table, or if this snapshot predates ICT enablement
-    /// - `Err(...)` if ICT is enabled but there was an error reading it (including file not found)
+    /// - `Ok(None)` if ICT is not enabled for this table, or if this snapshot predates ICT enablement, or if version = 0 (new table)
+    /// - `Err(...)` if ICT is enabled but commit file is not found in log segment or there was an error reading it
     pub(crate) fn get_in_commit_timestamp(&self, engine: &dyn Engine) -> DeltaResult<Option<i64>> {
+        // Handle version = 0 (new table) - no previous commit timestamp available
+        if self.version() == 0 {
+            return Ok(None);
+        }
+
         let enablement_info = self
             .table_configuration()
             .in_commit_timestamp_enablement()?;
 
         match enablement_info {
             Some((enablement_version, _)) if self.version() >= enablement_version => {
-                // STAGE 1: Try to find the commit file for this version in the log segment
+                // Validate latest commit exists before generating ICT
+                self.validate_latest_commit_exists_for_ict()?;
+
+                // Try to find the commit file for this version in the log segment
                 if let Some(commit_file_meta) = self
                     .log_segment
                     .ascending_commit_files
@@ -416,12 +421,6 @@ impl Snapshot {
                     .find(|path| path.version == self.version())
                 {
                     // Found commit in log segment - use the actual physical file location
-                    #[cfg(test)]
-                    eprintln!(
-                        "DEBUG: Using STAGE 1 - found commit in log segment at version {}",
-                        self.version()
-                    );
-
                     let commit_path = ParsedLogPath {
                         location: commit_file_meta.location.location.clone(),
                         filename: commit_file_meta.filename.clone(),
@@ -443,31 +442,49 @@ impl Snapshot {
 
                     Ok(Some(ict))
                 } else {
-                    // STAGE 2: Commit not in log segment (checkpoint-only scenario)
-                    // This handles cases where:
-                    // - Log segment only contains checkpoints (commits filtered out/ cleaned up)
-                    //
-                    // For catalog-managed tables: If we can read the file, catalog must allow access.
-                    #[cfg(test)]
-                    eprintln!("DEBUG: Using STAGE 2 fallback - commit not in log segment, constructing path from table_root for version {}", self.version());
-
-                    let commit_path = ParsedLogPath::new_commit(self.table_root(), self.version())?;
-                    let ict = commit_path
-                        .read_in_commit_timestamp(engine)
-                        .map_err(|e| {
-                            Error::generic(format!(
-                                "Failed to read In-Commit Timestamp for version {} (ICT enabled at version {}): {}",
-                                self.version(),
-                                enablement_version,
-                                e
-                            ))
-                        })?;
-
-                    Ok(Some(ict))
+                    // Commit not found in log segment - this means the latest commit file is missing
+                    Err(Error::generic(format!(
+                        "In-Commit Timestamp not available: commit file for version {} not found in log segment. \
+                        Kernel Rust implementation requires the latest commit file to be present.",
+                        self.version()
+                    )))
                 }
             }
             _ => Ok(None),
         }
+    }
+
+    /// Validates that the latest commit file exists for ICT-enabled tables.
+    ///
+    /// According to the Delta protocol and ecosystem consistency (Java Kernel/Spark behavior),
+    /// ICT requires the latest commit file to be present to ensure monotonic timestamp correctness.
+    /// This function checks if the current snapshot's commit file exists in the log segment.
+    ///
+    /// Note: This function assumes ICT is already enabled and should only be called
+    /// when `is_in_commit_timestamps_enabled()` returns true.
+    ///
+    /// Returns Ok(()) if latest commit exists.
+    /// Returns Err(...) if latest commit file is missing.
+    fn validate_latest_commit_exists_for_ict(&self) -> DeltaResult<()> {
+        let current_version = self.version();
+
+        // Check if the current snapshot's commit file exists in the log segment
+        let commit_exists = self
+            .log_segment()
+            .ascending_commit_files
+            .iter()
+            .any(|commit_file| commit_file.version == current_version);
+
+        if !commit_exists {
+            return Err(Error::generic(format!(
+                "Cannot write to table with In-Commit Timestamps enabled: latest commit file for version {} is missing. \
+                ICT requires the latest commit file to be present to ensure monotonic timestamp correctness. \
+                This behavior aligns with Java Kernel and Delta Spark implementations.",
+                current_version
+            )));
+        }
+
+        Ok(())
     }
 }
 
@@ -1307,13 +1324,17 @@ mod tests {
         let url = url::Url::parse("memory://test/")?;
         let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
 
-        // Create commit with ICT enabled but missing enablement info
+        // Create initial commit with ICT enabled but missing enablement info
         let commit0 = create_commit_with_ict_missing_enablement();
         add_commit(store.as_ref(), 0, commit0).await?;
 
-        let snapshot = Snapshot::builder_for(url).build(&engine)?;
+        // Create a second commit to test enablement validation on version > 0
+        let commit1 = create_commit_info(1234567890, Some(9876543210i64));
+        add_commit(store.as_ref(), 1, commit1.to_string()).await?;
 
-        // Should get error due to missing enablement metadata
+        let snapshot = Snapshot::builder_for(url).at_version(1).build(&engine)?;
+
+        // Should get error due to missing enablement metadata when trying to get timestamp
         let result = snapshot.get_in_commit_timestamp(&engine);
         assert_result_error_with_message(
             result,
@@ -1434,12 +1455,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_timestamp_checkpoint_only_demonstrates_stage2() -> DeltaResult<()> {
-        // Test that demonstrates STAGE 2 fallback is used when commit not in log segment
-        // This test shows that when the log segment doesn't contain the commit file,
-        // the code falls back to constructing the path from table_root
+    async fn test_get_timestamp_checkpoint_only_errors_with_require_commit() -> DeltaResult<()> {
+        // When ICT is enabled but commit file is not found in log segment, we should get an error
 
-        let url = Url::parse("memory:///fallback_test")?;
+        let url = Url::parse("memory:///require_commit_test")?;
         let store = Arc::new(InMemory::new());
         let engine = DefaultEngine::new(store.clone(), Arc::new(TokioBackgroundExecutor::new()));
 
@@ -1491,7 +1510,7 @@ mod tests {
         writer.close()?;
 
         let checkpoint_path =
-            Path::from("fallback_test/_delta_log/00000000000000000001.checkpoint.parquet");
+            Path::from("require_commit_test/_delta_log/00000000000000000001.checkpoint.parquet");
         let buffer_size = buffer.len() as u64;
         store.put(&checkpoint_path, buffer.into()).await?;
 
@@ -1518,21 +1537,15 @@ mod tests {
         let log_segment = LogSegment::try_new(listed_files, url.join("_delta_log/")?, Some(1))?;
         let table_config = normal_snapshot.table_configuration().clone();
 
-        // Create snapshot that will use STAGE 2 fallback
+        // Create snapshot that has no commit in log segment
         let checkpoint_only_snapshot = Snapshot::new(log_segment, table_config);
 
-        // Test that we can get ICT via Stage 2 fallback
-        let result = checkpoint_only_snapshot.get_in_commit_timestamp(&engine)?;
-        assert_eq!(
+        // Test that we get an error when commit file is not in log segment
+        let result = checkpoint_only_snapshot.get_in_commit_timestamp(&engine);
+        assert_result_error_with_message(
             result,
-            Some(expected_ict),
-            "Stage 2 fallback should successfully read ICT from constructed path"
+            "Cannot write to table with In-Commit Timestamps enabled: latest commit file for version 1 is missing",
         );
-
-        // This test successfully demonstrates that:
-        // 1. When commit is not in log segment (ascending_commit_files is empty)
-        // 2. Code falls back to Stage 2 (constructing path from table_root)
-        // 3. ICT can still be retrieved if the commit file exists at the constructed path
 
         Ok(())
     }

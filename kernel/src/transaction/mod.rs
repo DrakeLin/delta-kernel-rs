@@ -187,6 +187,7 @@ impl Transaction {
                 dup.app_id
             )));
         }
+        // Step 1: Generate SetTransaction actions
         let set_transaction_actions = self
             .set_transactions
             .clone()
@@ -199,7 +200,7 @@ impl Transaction {
             .table_configuration()
             .is_in_commit_timestamps_enabled()
         {
-            // Generate ICT timestamp based on previous commit
+            // Get the last commit timestamp and generate ICT timestamp
             let last_commit_timestamp = self.read_snapshot.get_in_commit_timestamp(engine)?;
             Some(generate_ict_timestamp(
                 self.commit_timestamp,
@@ -630,4 +631,8 @@ mod tests {
         let result = generate_ict_timestamp(current_time, Some(last_commit_time));
         assert_eq!(result, current_time);
     }
+
+    // Note: validate_latest_commit_exists_for_ict requires a full Snapshot object and engine
+    // which would make it a complex integration test. The main behavior is tested via
+    // Transaction::commit() in integration tests and through the snapshot tests.
 }

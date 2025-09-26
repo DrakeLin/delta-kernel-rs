@@ -1511,7 +1511,7 @@ mod tests {
         // Test case: With partition columns
         let schema = Arc::new(StructType::new_unchecked(vec![
             StructField::nullable("id", DataType::STRING),
-            StructField::nullable("date", DataType::DATE),  // Partition column
+            StructField::nullable("date", DataType::DATE), // Partition column
             StructField::nullable("value", DataType::LONG),
         ]));
 
@@ -1530,7 +1530,10 @@ mod tests {
 
         // Check the transform spec for the partition column
         match &transform_spec[0] {
-            FieldTransformSpec::MetadataDerivedColumn { field_index, insert_after } => {
+            FieldTransformSpec::MetadataDerivedColumn {
+                field_index,
+                insert_after,
+            } => {
                 assert_eq!(*field_index, 1); // Index of "date" in logical schema
                 assert_eq!(insert_after, &Some("id".to_string())); // After "id" which is physical
             }
@@ -1567,7 +1570,10 @@ mod tests {
 
         // Check first partition column transform
         match &transform_spec[0] {
-            FieldTransformSpec::MetadataDerivedColumn { field_index, insert_after } => {
+            FieldTransformSpec::MetadataDerivedColumn {
+                field_index,
+                insert_after,
+            } => {
                 assert_eq!(*field_index, 1); // Index of "part1"
                 assert_eq!(insert_after, &Some("col1".to_string()));
             }
@@ -1576,7 +1582,10 @@ mod tests {
 
         // Check second partition column transform
         match &transform_spec[1] {
-            FieldTransformSpec::MetadataDerivedColumn { field_index, insert_after } => {
+            FieldTransformSpec::MetadataDerivedColumn {
+                field_index,
+                insert_after,
+            } => {
                 assert_eq!(*field_index, 3); // Index of "part2"
                 assert_eq!(insert_after, &Some("col2".to_string()));
             }
@@ -1619,7 +1628,7 @@ mod tests {
     fn test_state_info_partition_at_beginning() {
         // Test case: Partition column at the beginning
         let schema = Arc::new(StructType::new_unchecked(vec![
-            StructField::nullable("date", DataType::DATE),  // Partition column
+            StructField::nullable("date", DataType::DATE), // Partition column
             StructField::nullable("id", DataType::STRING),
             StructField::nullable("value", DataType::LONG),
         ]));
@@ -1637,7 +1646,10 @@ mod tests {
         assert_eq!(transform_spec.len(), 1);
 
         match &transform_spec[0] {
-            FieldTransformSpec::MetadataDerivedColumn { field_index, insert_after } => {
+            FieldTransformSpec::MetadataDerivedColumn {
+                field_index,
+                insert_after,
+            } => {
                 assert_eq!(*field_index, 0); // Index of "date"
                 assert_eq!(insert_after, &None); // No physical field before it, so prepend
             }

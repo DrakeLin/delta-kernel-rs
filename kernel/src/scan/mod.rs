@@ -29,7 +29,7 @@ use crate::schema::{
 };
 use crate::snapshot::SnapshotRef;
 use crate::table_features::ColumnMappingMode;
-use crate::transforms::{get_transform_spec, ColumnType};
+use crate::transforms::{FieldTransformSpec, TransformSpec};
 use crate::{DeltaResult, Engine, EngineData, Error, FileMeta, Version};
 
 use self::log_replay::scan_action_iter;
@@ -117,23 +117,15 @@ impl ScanBuilder {
         // if no schema is provided, use snapshot's entire schema (e.g. SELECT *)
         let logical_schema = self.schema.unwrap_or_else(|| self.snapshot.schema());
         let state_info = StateInfo::try_new(
-            logical_schema.as_ref(),
+            logical_schema,
             self.snapshot.metadata().partition_columns(),
             self.snapshot.table_configuration().column_mapping_mode(),
+            self.predicate,
         )?;
-
-        let physical_predicate = match self.predicate {
-            Some(predicate) => PhysicalPredicate::try_new(&predicate, &logical_schema)?,
-            None => PhysicalPredicate::None,
-        };
 
         Ok(Scan {
             snapshot: self.snapshot,
-            logical_schema,
-            physical_schema: Arc::new(StructType::try_new(state_info.read_fields)?),
-            physical_predicate,
-            all_fields: Arc::new(state_info.all_fields),
-            have_partition_cols: state_info.have_partition_cols,
+            state_info: Arc::new(state_info),
         })
     }
 }
@@ -366,18 +358,14 @@ impl HasSelectionVector for ScanMetadata {
 /// scanning the table.
 pub struct Scan {
     snapshot: SnapshotRef,
-    logical_schema: SchemaRef,
-    physical_schema: SchemaRef,
-    physical_predicate: PhysicalPredicate,
-    all_fields: Arc<Vec<ColumnType>>,
-    have_partition_cols: bool,
+    state_info: Arc<StateInfo>,
 }
 
 impl std::fmt::Debug for Scan {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
         f.debug_struct("Scan")
-            .field("schema", &self.logical_schema)
-            .field("predicate", &self.physical_predicate)
+            .field("schema", &self.state_info.logical_schema)
+            .field("predicate", &self.state_info.physical_predicate)
             .finish()
     }
 }
@@ -406,7 +394,7 @@ impl Scan {
     ///
     /// [`Schema`]: crate::schema::Schema
     pub fn logical_schema(&self) -> &SchemaRef {
-        &self.logical_schema
+        &self.state_info.logical_schema
     }
 
     /// Get a shared reference to the physical [`Schema`] of the scan. This represents the schema
@@ -414,12 +402,12 @@ impl Scan {
     ///
     /// [`Schema`]: crate::schema::Schema
     pub fn physical_schema(&self) -> &SchemaRef {
-        &self.physical_schema
+        &self.state_info.physical_schema
     }
 
     /// Get the predicate [`PredicateRef`] of the scan.
     pub fn physical_predicate(&self) -> Option<PredicateRef> {
-        if let PhysicalPredicate::Some(ref predicate, _) = self.physical_predicate {
+        if let PhysicalPredicate::Some(ref predicate, _) = self.state_info.physical_predicate {
             Some(predicate.clone())
         } else {
             None
@@ -589,26 +577,10 @@ impl Scan {
         engine: &dyn Engine,
         action_batch_iter: impl Iterator<Item = DeltaResult<ActionsBatch>>,
     ) -> DeltaResult<impl Iterator<Item = DeltaResult<ScanMetadata>>> {
-        // Compute the static part of the transformation. This is `None` if no transformation is
-        // needed. We need transforms for:
-        // - Partition columns: Must be injected from partition values
-        // - Column mapping: Physical field names must be mapped to logical field names via output schema
-        let static_transform = (self.have_partition_cols
-            || self.snapshot.column_mapping_mode() != ColumnMappingMode::None)
-            .then(|| Arc::new(get_transform_spec(&self.all_fields)));
-        let physical_predicate = match self.physical_predicate.clone() {
-            PhysicalPredicate::StaticSkipAll => return Ok(None.into_iter().flatten()),
-            PhysicalPredicate::Some(predicate, schema) => Some((predicate, schema)),
-            PhysicalPredicate::None => None,
-        };
-        let it = scan_action_iter(
-            engine,
-            action_batch_iter,
-            self.logical_schema.clone(),
-            self.physical_schema.clone(),
-            static_transform,
-            physical_predicate,
-        );
+        if let PhysicalPredicate::StaticSkipAll = self.state_info.physical_predicate {
+            return Ok(None.into_iter().flatten());
+        }
+        let it = scan_action_iter(engine, action_batch_iter, self.state_info.clone());
         Ok(Some(it).into_iter().flatten())
     }
 
@@ -664,7 +636,7 @@ impl Scan {
 
         debug!(
             "Executing scan with logical schema {:#?} and physical schema {:#?}",
-            self.logical_schema, self.physical_schema
+            self.state_info.logical_schema, self.state_info.physical_schema
         );
 
         let table_root = self.snapshot.table_root().clone();
@@ -766,62 +738,59 @@ pub fn scan_row_schema() -> SchemaRef {
 }
 
 /// All the state needed to process a scan.
-struct StateInfo {
-    /// All fields referenced by the query.
-    all_fields: Vec<ColumnType>,
-    /// The physical (parquet) read schema to use.
-    read_fields: Vec<StructField>,
-    /// True if this query references any partition columns.
-    have_partition_cols: bool,
+pub(crate) struct StateInfo {
+    /// The logical schema for this scan
+    pub(crate) logical_schema: SchemaRef,
+    /// The physical schema to read from parquet files
+    pub(crate) physical_schema: SchemaRef,
+    /// The physical predicate for data skipping
+    pub(crate) physical_predicate: PhysicalPredicate,
+    /// Transform specification for converting physical to logical data
+    pub(crate) transform_spec: Option<Arc<TransformSpec>>,
 }
 
 impl StateInfo {
     /// Get the state needed to process a scan.
-    fn try_new(
-        logical_schema: &Schema,
+    pub(crate) fn try_new(
+        logical_schema: SchemaRef,
         partition_columns: &[String],
         column_mapping_mode: ColumnMappingMode,
+        predicate: Option<PredicateRef>,
     ) -> DeltaResult<Self> {
-        let mut have_partition_cols = false;
         let mut read_fields = Vec::with_capacity(logical_schema.num_fields());
         let mut read_field_names = HashSet::with_capacity(logical_schema.num_fields());
+        let mut transform_spec = Vec::new();
+        let mut last_physical_field: Option<String> = None;
 
-        // Loop over all selected fields and note if they are columns that will be read from the
-        // parquet file ([`ColumnType::Selected`]) or if they are partition columns and will need to
-        // be filled in by evaluating an expression ([`ColumnType::MetadataDerivedColumn`])
-        let all_fields = logical_schema
-            .fields()
-            .enumerate()
-            .map(|(index, logical_field)| -> DeltaResult<_> {
-                if partition_columns.contains(logical_field.name()) {
-                    if logical_field.is_metadata_column() {
-                        return Err(Error::Schema(format!(
-                            "Metadata column names must not match partition columns: {}",
-                            logical_field.name()
-                        )));
-                    }
-
-                    // Store the index into the schema for this field. When we turn it into an
-                    // expression in the inner loop, we will index into the schema and get the name and
-                    // data type, which we need to properly materialize the column.
-                    have_partition_cols = true;
-                    Ok(ColumnType::MetadataDerivedColumn(index))
-                } else {
-                    // Add to read schema, store field so we can build a `Column` expression later
-                    // if needed (i.e. if we have partition columns)
-                    let physical_field = logical_field.make_physical(column_mapping_mode);
-                    debug!("\n\n{logical_field:#?}\nAfter mapping: {physical_field:#?}\n\n");
-                    let physical_name = physical_field.name.clone();
-                    read_fields.push(physical_field);
-
-                    if !logical_field.is_metadata_column() {
-                        read_field_names.insert(physical_name.clone());
-                    }
-
-                    Ok(ColumnType::Selected(physical_name))
+        // Loop over all selected fields and build both the physical schema and transform spec
+        for (index, logical_field) in logical_schema.fields().enumerate() {
+            if partition_columns.contains(logical_field.name()) {
+                if logical_field.is_metadata_column() {
+                    return Err(Error::Schema(format!(
+                        "Metadata column names must not match partition columns: {}",
+                        logical_field.name()
+                    )));
                 }
-            })
-            .try_collect()?;
+
+                // Partition column: needs to be injected via transform
+                transform_spec.push(FieldTransformSpec::MetadataDerivedColumn {
+                    field_index: index,
+                    insert_after: last_physical_field.clone(),
+                });
+            } else {
+                // Regular field: add to physical schema
+                let physical_field = logical_field.make_physical(column_mapping_mode);
+                debug!("\n\n{logical_field:#?}\nAfter mapping: {physical_field:#?}\n\n");
+                let physical_name = physical_field.name.clone();
+
+                if !logical_field.is_metadata_column() {
+                    read_field_names.insert(physical_name.clone());
+                }
+
+                last_physical_field = Some(physical_name);
+                read_fields.push(physical_field);
+            }
+        }
 
         // This iteration runs in O(3) time since each metadata column can appear at most once in the schema
         for metadata_column in logical_schema.metadata_columns() {
@@ -833,10 +802,25 @@ impl StateInfo {
             }
         }
 
+        let physical_schema = Arc::new(StructType::try_new(read_fields)?);
+
+        let physical_predicate = match predicate {
+            Some(pred) => PhysicalPredicate::try_new(&pred, &logical_schema)?,
+            None => PhysicalPredicate::None,
+        };
+
+        let transform_spec =
+            if !transform_spec.is_empty() || column_mapping_mode != ColumnMappingMode::None {
+                Some(Arc::new(transform_spec))
+            } else {
+                None
+            };
+
         Ok(StateInfo {
-            all_fields,
-            read_fields,
-            have_partition_cols,
+            logical_schema,
+            physical_schema,
+            physical_predicate,
+            transform_spec,
         })
     }
 }
@@ -872,6 +856,7 @@ pub(crate) mod test_utils {
     };
 
     use super::state::ScanCallback;
+    use super::{PhysicalPredicate, StateInfo};
     use crate::transforms::TransformSpec;
 
     // Generates a batch of sidecar actions with the given paths.
@@ -966,15 +951,18 @@ pub(crate) mod test_utils {
     ) {
         let logical_schema = logical_schema
             .unwrap_or_else(|| Arc::new(crate::schema::StructType::new_unchecked(vec![])));
+        let state_info = Arc::new(StateInfo {
+            logical_schema: logical_schema.clone(),
+            physical_schema: logical_schema.clone(),
+            physical_predicate: PhysicalPredicate::None,
+            transform_spec,
+        });
         let iter = scan_action_iter(
             &SyncEngine::new(),
             batch
                 .into_iter()
                 .map(|batch| Ok(ActionsBatch::new(batch as _, true))),
-            logical_schema.clone(),
-            logical_schema,
-            transform_spec,
-            None,
+            state_info,
         );
         let mut batch_count = 0;
         for res in iter {

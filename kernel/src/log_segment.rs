@@ -17,8 +17,8 @@ use crate::path::{LogPathFileType, ParsedLogPath};
 use crate::schema::{DataType, Schema, SchemaRef, StructField, StructType, ToSchema as _};
 use crate::utils::require;
 use crate::{
-    DeltaResult, Engine, EngineData, Error, Expression, FileMeta, ParquetFooter, ParquetHandler,
-    Predicate, PredicateRef, RowVisitor, StorageHandler, Version,
+    DeltaResult, Engine, EngineData, Error, Expression, FileMeta, ParquetHandler, Predicate,
+    PredicateRef, RowVisitor, StorageHandler, Version,
 };
 use delta_kernel_derive::internal_api;
 

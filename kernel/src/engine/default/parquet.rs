@@ -296,6 +296,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
     /// - `location` - The full URL path where the Parquet file should be written
     ///   (e.g., `s3://bucket/path/file.parquet`, `file:///path/to/file.parquet`).
     /// - `data` - An iterator of engine data to be written to the Parquet file.
+    /// - `stats_columns` - Optional column names for which statistics should be collected.
     ///
     /// # Returns
     ///
@@ -304,6 +305,7 @@ impl<E: TaskExecutor> ParquetHandler for DefaultParquetHandler<E> {
         &self,
         location: url::Url,
         mut data: Box<dyn Iterator<Item = DeltaResult<Box<dyn EngineData>>> + Send>,
+        _stats_columns: Option<&[ColumnName]>,
     ) -> DeltaResult<()> {
         let store = self.store.clone();
 
@@ -778,7 +780,7 @@ mod tests {
         // Test writing through the trait method
         let file_url = Url::parse("memory:///test/data.parquet").unwrap();
         parquet_handler
-            .write_parquet_file(file_url.clone(), data_iter)
+            .write_parquet_file(file_url.clone(), data_iter, None)
             .unwrap();
 
         // Verify we can read the file back
@@ -966,7 +968,7 @@ mod tests {
         // Write the data
         let file_url = Url::parse("memory:///roundtrip/test.parquet").unwrap();
         parquet_handler
-            .write_parquet_file(file_url.clone(), data_iter)
+            .write_parquet_file(file_url.clone(), data_iter, None)
             .unwrap();
 
         // Read it back
@@ -1154,7 +1156,7 @@ mod tests {
 
         // Write the first file
         parquet_handler
-            .write_parquet_file(file_url.clone(), data_iter1)
+            .write_parquet_file(file_url.clone(), data_iter1, None)
             .unwrap();
 
         // Create second data set with different data
@@ -1170,7 +1172,7 @@ mod tests {
 
         // Overwrite with second file (overwrite=true)
         parquet_handler
-            .write_parquet_file(file_url.clone(), data_iter2)
+            .write_parquet_file(file_url.clone(), data_iter2, None)
             .unwrap();
 
         // Read back and verify it contains the second data set
@@ -1233,7 +1235,7 @@ mod tests {
 
         // Write the first file
         parquet_handler
-            .write_parquet_file(file_url.clone(), data_iter1)
+            .write_parquet_file(file_url.clone(), data_iter1, None)
             .unwrap();
 
         // Create second data set
@@ -1249,7 +1251,7 @@ mod tests {
 
         // Write again - should overwrite successfully (new behavior always overwrites)
         parquet_handler
-            .write_parquet_file(file_url.clone(), data_iter2)
+            .write_parquet_file(file_url.clone(), data_iter2, None)
             .unwrap();
 
         // Verify the file was overwritten with the new data

@@ -216,8 +216,21 @@ mod tests {
     ) -> DeltaResult<()> {
         let (engine, snapshot, _tempdir) = load_test_table(table_name)?;
 
+<<<<<<< HEAD
         let scan = snapshot.scan_builder().build()?;
         let mut sequential = scan.parallel_scan_metadata(engine)?;
+=======
+        let state_info = Arc::new(StateInfo::try_new(
+            snapshot.schema(),
+            snapshot.table_configuration(),
+            None,
+            None,
+            (),
+        )?);
+
+        let processor = ScanLogReplayProcessor::new(engine.as_ref(), state_info)?;
+        let mut sequential = SequentialPhase::try_new(processor, log_segment, engine.clone())?;
+>>>>>>> 98b87ff2 (feat(scan): add two-schema infrastructure to StateInfo for stats output)
 
         // Process all batches and collect Add file paths
         let mut file_paths = Vec::new();
@@ -299,8 +312,26 @@ mod tests {
     fn test_sequential_finish_before_exhaustion_error() -> DeltaResult<()> {
         let (engine, snapshot, _tempdir) = load_test_table("table-without-dv-small")?;
 
+<<<<<<< HEAD
         let scan = snapshot.scan_builder().build()?;
         let sequential = scan.parallel_scan_metadata(engine)?;
+=======
+        let state_info = Arc::new(StateInfo::try_new(
+            snapshot.schema(),
+            snapshot.table_configuration(),
+            None,
+            None,
+            (),
+        )?);
+
+        let processor = ScanLogReplayProcessor::new(engine.as_ref(), state_info)?;
+        let mut sequential = SequentialPhase::try_new(processor, log_segment, engine.clone())?;
+
+        // Call next() once but don't exhaust the iterator
+        if let Some(result) = sequential.next() {
+            result?;
+        }
+>>>>>>> 98b87ff2 (feat(scan): add two-schema infrastructure to StateInfo for stats output)
 
         // Try to call finish() before exhausting the iterator
         let result = sequential.finish();

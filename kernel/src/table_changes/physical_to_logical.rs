@@ -183,7 +183,15 @@ mod tests {
             physical_predicate: PhysicalPredicate::None,
             transform_spec: Some(Arc::new(transform_spec)),
             column_mapping_mode: ColumnMappingMode::None,
+<<<<<<< HEAD
             stats_schema: None,
+=======
+<<<<<<< HEAD
+=======
+            stats_schema: None,
+            output_stats_schema: None,
+>>>>>>> 98b87ff2 (feat(scan): add two-schema infrastructure to StateInfo for stats output)
+>>>>>>> abb9bf82 (feat(scan): add two-schema infrastructure to StateInfo for stats output)
         }
     }
 
@@ -402,7 +410,15 @@ mod tests {
             physical_predicate: PhysicalPredicate::None,
             transform_spec: Some(Arc::new(transform_spec)),
             column_mapping_mode: ColumnMappingMode::None,
+<<<<<<< HEAD
             stats_schema: None,
+=======
+<<<<<<< HEAD
+=======
+            stats_schema: None,
+            output_stats_schema: None,
+>>>>>>> 98b87ff2 (feat(scan): add two-schema infrastructure to StateInfo for stats output)
+>>>>>>> abb9bf82 (feat(scan): add two-schema infrastructure to StateInfo for stats output)
         };
 
         let result = get_cdf_transform_expr(&scan_file, &state_info, &physical_schema);

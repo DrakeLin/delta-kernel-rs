@@ -36,7 +36,16 @@ struct InternalScanState {
     predicate_schema: Option<Arc<StructType>>,
     transform_spec: Option<Arc<TransformSpec>>,
     column_mapping_mode: ColumnMappingMode,
+<<<<<<< HEAD
     stats_schema: Option<SchemaRef>,
+=======
+<<<<<<< HEAD
+=======
+    stats_schema: Option<SchemaRef>,
+    #[serde(default)]
+    output_stats_schema: Option<SchemaRef>,
+>>>>>>> 98b87ff2 (feat(scan): add two-schema infrastructure to StateInfo for stats output)
+>>>>>>> abb9bf82 (feat(scan): add two-schema infrastructure to StateInfo for stats output)
 }
 
 /// Serializable processor state for distributed processing. This can be serialized using the
@@ -186,7 +195,15 @@ impl ScanLogReplayProcessor {
             physical_predicate,
             transform_spec,
             column_mapping_mode,
+<<<<<<< HEAD
             stats_schema,
+=======
+<<<<<<< HEAD
+=======
+            stats_schema,
+            output_stats_schema,
+>>>>>>> 98b87ff2 (feat(scan): add two-schema infrastructure to StateInfo for stats output)
+>>>>>>> abb9bf82 (feat(scan): add two-schema infrastructure to StateInfo for stats output)
         } = self.state_info.as_ref().clone();
 
         // Extract predicate from PhysicalPredicate
@@ -202,7 +219,15 @@ impl ScanLogReplayProcessor {
             transform_spec,
             predicate_schema,
             column_mapping_mode,
+<<<<<<< HEAD
             stats_schema,
+=======
+<<<<<<< HEAD
+=======
+            stats_schema,
+            output_stats_schema,
+>>>>>>> 98b87ff2 (feat(scan): add two-schema infrastructure to StateInfo for stats output)
+>>>>>>> abb9bf82 (feat(scan): add two-schema infrastructure to StateInfo for stats output)
         };
         let internal_state_blob = serde_json::to_vec(&internal_state)
             .map_err(|e| Error::generic(format!("Failed to serialize internal state: {}", e)))?;
@@ -258,7 +283,15 @@ impl ScanLogReplayProcessor {
             physical_predicate,
             transform_spec: internal_state.transform_spec,
             column_mapping_mode: internal_state.column_mapping_mode,
+<<<<<<< HEAD
             stats_schema: internal_state.stats_schema,
+=======
+<<<<<<< HEAD
+=======
+            stats_schema: internal_state.stats_schema,
+            output_stats_schema: internal_state.output_stats_schema,
+>>>>>>> 98b87ff2 (feat(scan): add two-schema infrastructure to StateInfo for stats output)
+>>>>>>> abb9bf82 (feat(scan): add two-schema infrastructure to StateInfo for stats output)
         });
 
         let processor = Self::new_with_seen_files(engine, state_info, state.seen_file_keys)?;
@@ -760,7 +793,15 @@ mod tests {
             physical_predicate: PhysicalPredicate::None,
             transform_spec: None,
             column_mapping_mode: ColumnMappingMode::None,
+<<<<<<< HEAD
             stats_schema: None,
+=======
+<<<<<<< HEAD
+=======
+            stats_schema: None,
+            output_stats_schema: None,
+>>>>>>> 98b87ff2 (feat(scan): add two-schema infrastructure to StateInfo for stats output)
+>>>>>>> abb9bf82 (feat(scan): add two-schema infrastructure to StateInfo for stats output)
         });
         let iter = scan_action_iter(
             &SyncEngine::new(),
@@ -1053,7 +1094,15 @@ mod tests {
                 physical_predicate: PhysicalPredicate::None,
                 transform_spec: None,
                 column_mapping_mode: mode,
+<<<<<<< HEAD
                 stats_schema: None,
+=======
+<<<<<<< HEAD
+=======
+                stats_schema: None,
+                output_stats_schema: None,
+>>>>>>> 98b87ff2 (feat(scan): add two-schema infrastructure to StateInfo for stats output)
+>>>>>>> abb9bf82 (feat(scan): add two-schema infrastructure to StateInfo for stats output)
             });
             let processor = ScanLogReplayProcessor::new(&engine, state_info).unwrap();
             let deserialized = ScanLogReplayProcessor::from_serializable_state(
@@ -1080,7 +1129,15 @@ mod tests {
             physical_predicate: PhysicalPredicate::None,
             transform_spec: None,
             column_mapping_mode: ColumnMappingMode::None,
+<<<<<<< HEAD
             stats_schema: None,
+=======
+<<<<<<< HEAD
+=======
+            stats_schema: None,
+            output_stats_schema: None,
+>>>>>>> 98b87ff2 (feat(scan): add two-schema infrastructure to StateInfo for stats output)
+>>>>>>> abb9bf82 (feat(scan): add two-schema infrastructure to StateInfo for stats output)
         });
         let processor = ScanLogReplayProcessor::new(&engine, state_info).unwrap();
         let serialized = processor.into_serializable_state().unwrap();
@@ -1118,7 +1175,15 @@ mod tests {
             predicate_schema: None, // Missing!
             transform_spec: None,
             column_mapping_mode: ColumnMappingMode::None,
+<<<<<<< HEAD
             stats_schema: None,
+=======
+<<<<<<< HEAD
+=======
+            stats_schema: None,
+            output_stats_schema: None,
+>>>>>>> 98b87ff2 (feat(scan): add two-schema infrastructure to StateInfo for stats output)
+>>>>>>> abb9bf82 (feat(scan): add two-schema infrastructure to StateInfo for stats output)
         };
         let predicate = Arc::new(crate::expressions::Predicate::column(["id"]));
         let invalid_blob = serde_json::to_vec(&invalid_internal_state).unwrap();
@@ -1147,7 +1212,15 @@ mod tests {
             predicate_schema: None,
             transform_spec: None,
             column_mapping_mode: ColumnMappingMode::None,
+<<<<<<< HEAD
             stats_schema: None,
+=======
+<<<<<<< HEAD
+=======
+            stats_schema: None,
+            output_stats_schema: None,
+>>>>>>> 98b87ff2 (feat(scan): add two-schema infrastructure to StateInfo for stats output)
+>>>>>>> abb9bf82 (feat(scan): add two-schema infrastructure to StateInfo for stats output)
         };
         let blob = serde_json::to_string(&invalid_internal_state).unwrap();
         let mut obj: serde_json::Value = serde_json::from_str(&blob).unwrap();

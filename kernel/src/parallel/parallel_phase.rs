@@ -388,7 +388,22 @@ mod tests {
         let scan = builder.build()?;
         let mut phase1 = scan.parallel_scan_metadata(engine.clone())?;
 
+<<<<<<< HEAD
         let mut all_paths = phase1.try_fold(Vec::new(), |acc, metadata_res| {
+=======
+        let state_info = Arc::new(StateInfo::try_new(
+            snapshot.schema(),
+            snapshot.table_configuration(),
+            None,
+            None,
+            (),
+        )?);
+        let processor = ScanLogReplayProcessor::new(engine.as_ref(), state_info)?;
+        let mut sequential = SequentialPhase::try_new(processor, &log_segment, engine.clone())?;
+
+        // Process all batches in sequential phase and collect paths
+        let mut all_paths = sequential.try_fold(Vec::new(), |acc, metadata_res| {
+>>>>>>> 98b87ff2 (feat(scan): add two-schema infrastructure to StateInfo for stats output)
             metadata_res?.visit_scan_files(acc, |ps: &mut Vec<String>, scan_file| {
                 ps.push(scan_file.path);
             })

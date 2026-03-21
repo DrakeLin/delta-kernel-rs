@@ -1145,9 +1145,10 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_as_is_if_schem
     let checkpoint_result = log_segment.create_checkpoint_stream(
         &engine,
         v2_checkpoint_read_schema.clone(),
-        None, // meta_predicate
-        None, // stats_schema
-        None, // partition_schema
+        None,   // meta_predicate
+        vec![], // partition_columns
+        None,   // stats_schema
+        None,   // partition_schema
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -1215,9 +1216,10 @@ async fn test_create_checkpoint_stream_returns_checkpoint_batches_if_checkpoint_
     let checkpoint_result = log_segment.create_checkpoint_stream(
         &engine,
         v2_checkpoint_read_schema.clone(),
-        None, // meta_predicate
-        None, // stats_schema
-        None, // partition_schema
+        None,   // meta_predicate
+        vec![], // partition_columns
+        None,   // stats_schema
+        None,   // partition_schema
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -1280,9 +1282,10 @@ async fn test_create_checkpoint_stream_reads_parquet_checkpoint_batch_without_si
     let checkpoint_result = log_segment.create_checkpoint_stream(
         &engine,
         v2_checkpoint_read_schema.clone(),
-        None, // meta_predicate
-        None, // stats_schema
-        None, // partition_schema
+        None,   // meta_predicate
+        vec![], // partition_columns
+        None,   // stats_schema
+        None,   // partition_schema
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -1334,9 +1337,10 @@ async fn test_create_checkpoint_stream_reads_json_checkpoint_batch_without_sidec
     let checkpoint_result = log_segment.create_checkpoint_stream(
         &engine,
         v2_checkpoint_read_schema,
-        None, // meta_predicate
-        None, // stats_schema
-        None, // partition_schema
+        None,   // meta_predicate
+        vec![], // partition_columns
+        None,   // stats_schema
+        None,   // partition_schema
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -1426,9 +1430,10 @@ async fn test_create_checkpoint_stream_reads_checkpoint_file_and_returns_sidecar
     let checkpoint_result = log_segment.create_checkpoint_stream(
         &engine,
         v2_checkpoint_read_schema.clone(),
-        None, // meta_predicate
-        None, // stats_schema
-        None, // partition_schema
+        None,   // meta_predicate
+        vec![], // partition_columns
+        None,   // stats_schema
+        None,   // partition_schema
     )?;
     let mut iter = checkpoint_result.actions;
 
@@ -3402,8 +3407,9 @@ async fn test_checkpoint_stream_sets_has_partition_values_parsed() -> DeltaResul
     let checkpoint_result = log_segment.create_checkpoint_stream(
         &engine,
         read_schema,
-        None, // meta_predicate
-        None, // stats_schema
+        None,   // meta_predicate
+        vec![], // partition_columns
+        None,   // stats_schema
         Some(&partition_schema),
     )?;
 
@@ -3468,6 +3474,7 @@ async fn test_checkpoint_stream_no_partition_values_parsed_when_incompatible() -
         &engine,
         read_schema.clone(),
         None,
+        vec![], // partition_columns
         None,
         Some(&partition_schema),
     )?;

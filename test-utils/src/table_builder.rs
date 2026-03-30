@@ -122,6 +122,54 @@ impl FeatureSet {
     pub fn empty() -> Self {
         Self::new()
     }
+
+    /// Enable column mapping with the given mode ("none", "name", or "id").
+    pub fn column_mapping(mut self, mode: &str) -> Self {
+        if mode != "none" {
+            self.table_properties
+                .push(("delta.columnMapping.mode".into(), mode.into()));
+        }
+        self
+    }
+
+    /// Enable V2 checkpoints.
+    pub fn v2_checkpoint(mut self) -> Self {
+        self.table_properties
+            .push(("delta.feature.v2Checkpoint".into(), "supported".into()));
+        self
+    }
+
+    /// Enable in-commit timestamps.
+    pub fn ict(mut self) -> Self {
+        self.table_properties
+            .push(("delta.enableInCommitTimestamps".into(), "true".into()));
+        self
+    }
+
+    /// Set an arbitrary table property. Useful for properties that don't have a
+    /// dedicated method (e.g. `delta.checkpoint.writeStatsAsJson`).
+    pub fn with_property(mut self, key: &str, value: &str) -> Self {
+        self.table_properties.push((key.into(), value.into()));
+        self
+    }
+
+    /// All standard feature sets for cross-product testing.
+    pub fn all() -> Vec<Self> {
+        vec![
+            Self::empty(),
+            Self::new().column_mapping("name"),
+            Self::new().ict(),
+            Self::new().v2_checkpoint(),
+            Self::new().column_mapping("name").ict(),
+        ]
+    }
+
+    /// Whether v2_checkpoint is enabled.
+    pub fn has_v2_checkpoint(&self) -> bool {
+        self.table_properties
+            .iter()
+            .any(|(k, v)| k == "delta.feature.v2Checkpoint" && v == "supported")
+    }
 }
 
 impl fmt::Display for FeatureSet {
@@ -844,6 +892,68 @@ mod tests {
             VersionTarget::Incremental { to, .. } => *to,
         };
         assert_eq!(snap.version(), expected);
+    }
+
+    #[test]
+    fn test_with_column_mapping() -> DeltaResult<()> {
+        let table = TestTableBuilder::new()
+            .features(FeatureSet::new().column_mapping("name"))
+            .build()?;
+        let engine = table.engine();
+        let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
+        let protocol = snap.table_configuration().protocol();
+        assert_eq!(protocol.min_reader_version(), 3);
+        assert_eq!(protocol.min_writer_version(), 7);
+        Ok(())
+    }
+
+    #[test]
+    fn test_with_ict() -> DeltaResult<()> {
+        let table = TestTableBuilder::new()
+            .features(FeatureSet::new().ict())
+            .build()?;
+        let engine = table.engine();
+        let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
+        let protocol = snap.table_configuration().protocol();
+        assert_eq!(protocol.min_reader_version(), 3);
+        assert_eq!(protocol.min_writer_version(), 7);
+        Ok(())
+    }
+
+    #[test]
+    fn test_combined_features() -> DeltaResult<()> {
+        let table = TestTableBuilder::new()
+            .features(
+                FeatureSet::new()
+                    .column_mapping("name")
+                    .ict()
+                    .v2_checkpoint(),
+            )
+            .build()?;
+        let engine = table.engine();
+        let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
+        let protocol = snap.table_configuration().protocol();
+        assert_eq!(protocol.min_reader_version(), 3);
+        assert_eq!(protocol.min_writer_version(), 7);
+        Ok(())
+    }
+
+    #[test]
+    fn test_scan_with_column_mapping() -> DeltaResult<()> {
+        let table = TestTableBuilder::new()
+            .log_state(LogState::commits(2))
+            .features(FeatureSet::new().column_mapping("name"))
+            .data(1, 5)
+            .build()?;
+        let engine = table.engine();
+        let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
+        let scan = snap.scan_builder().build()?;
+        let engine_arc: Arc<dyn delta_kernel::Engine> =
+            Arc::new(DefaultEngineBuilder::new(table.store().clone()).build());
+        let batches = crate::read_scan(&scan, engine_arc)?;
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 5);
+        Ok(())
     }
 
     #[test]

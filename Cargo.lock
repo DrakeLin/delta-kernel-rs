@@ -4034,6 +4034,7 @@ dependencies = [
 name = "test_utils"
 version = "0.20.0"
 dependencies = [
+ "chrono",
  "delta_kernel",
  "itertools 0.14.0",
  "rstest",

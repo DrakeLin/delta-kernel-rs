@@ -36,10 +36,19 @@
 //! The macros expand there, so types resolve to the caller's kernel crate -- avoiding
 //! the type mismatch between `test_utils`'s kernel and `kernel/src/` unit tests.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
+use delta_kernel::arrow::array::{
+    ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
+    Int16Array, Int32Array, Int64Array, Int8Array, RecordBatch, StringArray,
+    TimestampMicrosecondArray,
+};
+use delta_kernel::arrow::datatypes::{DataType as ArrowDataType, Schema as ArrowSchema, TimeUnit};
 use delta_kernel::committer::FileSystemCommitter;
+use delta_kernel::engine::arrow_conversion::TryFromKernel;
+use delta_kernel::engine::arrow_data::ArrowEngineData;
 use delta_kernel::engine::default::executor::tokio::{
     TokioBackgroundExecutor, TokioMultiThreadExecutor,
 };
@@ -213,6 +222,8 @@ pub struct TestTableBuilder {
     log_state: LogState,
     features: FeatureSet,
     schema: Option<SchemaRef>,
+    num_data_files: usize,
+    rows_per_file: usize,
 }
 
 impl Default for TestTableBuilder {
@@ -228,6 +239,8 @@ impl TestTableBuilder {
             log_state: LogState::commits(1),
             features: FeatureSet::empty(),
             schema: None,
+            num_data_files: 1,
+            rows_per_file: 10,
         }
     }
 
@@ -246,6 +259,15 @@ impl TestTableBuilder {
     /// Override the default schema.
     pub fn schema(mut self, s: SchemaRef) -> Self {
         self.schema = Some(s);
+        self
+    }
+
+    /// Set the number of parquet data files written in each data commit (versions 1..N),
+    /// and the number of rows per file. For example, `data(2, 5)` writes 2 files with 5
+    /// rows each per commit.
+    pub fn data(mut self, files_per_commit: usize, rows_per_file: usize) -> Self {
+        self.num_data_files = files_per_commit;
+        self.rows_per_file = rows_per_file;
         self
     }
 
@@ -286,8 +308,15 @@ impl TestTableBuilder {
 
         // Data commits (versions 1..N)
         let total = self.log_state.total_versions();
-        for _v in 1..total {
-            let result = write_empty_commit(snapshot.clone(), &engine)?;
+        for v in 1..total {
+            let result = write_data_commit(
+                snapshot.clone(),
+                &engine,
+                self.num_data_files,
+                self.rows_per_file,
+                v,
+            )
+            .await?;
             snapshot = result
                 .unwrap_committed()
                 .post_commit_snapshot()
@@ -304,18 +333,128 @@ impl TestTableBuilder {
 }
 
 // ===========================================================================
-// Empty commit
+// Data commit via kernel write path
 // ===========================================================================
 
-/// Write an empty commit (no data files) using kernel's transaction path.
-fn write_empty_commit(
+/// Write a data commit using kernel's transaction + write_parquet path.
+/// Produces `num_files` parquet files with `rows_per_file` rows each.
+async fn write_data_commit(
     snapshot: Arc<Snapshot>,
     engine: &Arc<DefaultEngine<TokioMultiThreadExecutor>>,
+    num_files: usize,
+    rows_per_file: usize,
+    version: u64,
 ) -> DeltaResult<delta_kernel::transaction::CommitResult> {
-    let txn = snapshot
+    let logical_schema = snapshot.schema().clone();
+    let arrow_schema: ArrowSchema = TryFromKernel::try_from_kernel(logical_schema.as_ref())
+        .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+
+    let mut txn = snapshot
         .transaction(Box::new(FileSystemCommitter::new()), engine.as_ref())?
-        .with_operation("WRITE".to_string());
+        .with_operation("WRITE".to_string())
+        .with_data_change(true);
+
+    let write_context = txn.get_write_context();
+
+    for file_idx in 0..num_files {
+        let base = (version as i32 * 1000) + (file_idx as i32 * 100);
+        let columns: Vec<ArrayRef> = arrow_schema
+            .fields()
+            .iter()
+            .map(|f| generate_column(f.data_type(), rows_per_file, base))
+            .collect();
+        let batch = RecordBatch::try_new(Arc::new(arrow_schema.clone()), columns)
+            .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
+
+        let add_files = engine
+            .write_parquet(
+                &ArrowEngineData::new(batch),
+                &write_context,
+                HashMap::new(),
+            )
+            .await?;
+        txn.add_files(add_files);
+    }
+
     txn.commit(engine.as_ref())
+}
+
+/// Generate a single column of data based on its Arrow type.
+/// Data is deterministic: values are derived from `base` (version * 1000 + file_idx * 100).
+fn generate_column(arrow_type: &ArrowDataType, rows: usize, base: i32) -> ArrayRef {
+    match arrow_type {
+        #[allow(unknown_lints, clippy::manual_is_multiple_of)]
+        ArrowDataType::Boolean => {
+            let values: Vec<bool> = (0..rows).map(|i| (base as usize + i) % 2 == 0).collect();
+            Arc::new(BooleanArray::from(values))
+        }
+        ArrowDataType::Int8 => {
+            let values: Vec<i8> = (0..rows).map(|i| ((base + i as i32) % 120) as i8).collect();
+            Arc::new(Int8Array::from(values))
+        }
+        ArrowDataType::Int16 => {
+            let values: Vec<i16> = (0..rows)
+                .map(|i| ((base + i as i32) % 30000) as i16)
+                .collect();
+            Arc::new(Int16Array::from(values))
+        }
+        ArrowDataType::Int32 => {
+            let values: Vec<i32> = (0..rows).map(|i| base + i as i32).collect();
+            Arc::new(Int32Array::from(values))
+        }
+        ArrowDataType::Int64 => {
+            let values: Vec<i64> = (0..rows).map(|i| (base + i as i32) as i64 * 1000).collect();
+            Arc::new(Int64Array::from(values))
+        }
+        ArrowDataType::Float32 => {
+            let values: Vec<f32> = (0..rows).map(|i| base as f32 + i as f32 * 0.5).collect();
+            Arc::new(Float32Array::from(values))
+        }
+        ArrowDataType::Float64 => {
+            let values: Vec<f64> = (0..rows).map(|i| base as f64 + i as f64 * 0.25).collect();
+            Arc::new(Float64Array::from(values))
+        }
+        ArrowDataType::Utf8 => {
+            let values: Vec<String> = (0..rows)
+                .map(|i| format!("val_{}", base + i as i32))
+                .collect();
+            Arc::new(StringArray::from(values))
+        }
+        ArrowDataType::Binary => {
+            let values: Vec<Vec<u8>> = (0..rows)
+                .map(|i| format!("bin_{}", base + i as i32).into_bytes())
+                .collect();
+            Arc::new(BinaryArray::from(
+                values.iter().map(|v| v.as_slice()).collect::<Vec<_>>(),
+            ))
+        }
+        ArrowDataType::Date32 => {
+            let values: Vec<i32> = (0..rows).map(|i| 18000 + base + i as i32).collect();
+            Arc::new(Date32Array::from(values))
+        }
+        ArrowDataType::Timestamp(TimeUnit::Microsecond, tz) => {
+            let values: Vec<i64> = (0..rows)
+                .map(|i| (18000 + base + i as i32) as i64 * 86_400_000_000)
+                .collect();
+            let array = TimestampMicrosecondArray::from(values);
+            match tz {
+                Some(tz) => Arc::new(array.with_timezone(tz.as_ref())),
+                None => Arc::new(array),
+            }
+        }
+        ArrowDataType::Decimal128(precision, scale) => {
+            let scale_factor = 10i128.pow(*scale as u32);
+            let values: Vec<i128> = (0..rows)
+                .map(|i| (base + i as i32) as i128 * scale_factor)
+                .collect();
+            Arc::new(
+                Decimal128Array::from(values)
+                    .with_precision_and_scale(*precision, *scale)
+                    .expect("valid decimal"),
+            )
+        }
+        other => panic!("unsupported Arrow type in test data generation: {other:?}"),
+    }
 }
 
 // ===========================================================================
@@ -508,6 +647,23 @@ mod tests {
             VersionTarget::Incremental { to, .. } => *to,
         };
         assert_eq!(snap.version(), expected);
+    }
+
+    #[test]
+    fn test_scan_with_data() -> DeltaResult<()> {
+        let table = TestTableBuilder::new()
+            .log_state(LogState::commits(2))
+            .data(2, 5)
+            .build()?;
+        let engine = table.engine();
+        let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
+        let scan = snap.scan_builder().build()?;
+        let engine_arc: Arc<dyn delta_kernel::Engine> =
+            Arc::new(DefaultEngineBuilder::new(table.store().clone()).build());
+        let batches = crate::read_scan(&scan, engine_arc)?;
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 10);
+        Ok(())
     }
 
     #[test]

@@ -57,6 +57,7 @@ use delta_kernel::object_store::memory::InMemory;
 use delta_kernel::object_store::DynObjectStore;
 use delta_kernel::schema::{DataType, SchemaRef, StructField, StructType};
 use delta_kernel::transaction::create_table::create_table;
+use delta_kernel::transaction::data_layout::DataLayout;
 use delta_kernel::{DeltaResult, Snapshot};
 
 // ===========================================================================
@@ -148,6 +149,70 @@ impl fmt::Display for FeatureSet {
 }
 
 // ===========================================================================
+// DataLayoutConfig
+// ===========================================================================
+
+/// Data layout configuration for cross-product testing (partitioning, clustering, etc.).
+///
+/// Designed for rstest `#[values]` parameterization alongside [`LogState`] and
+/// [`FeatureSet`].
+#[derive(Clone, Debug)]
+pub enum DataLayoutConfig {
+    /// No partition columns (default schema).
+    Unpartitioned,
+    /// Partition by every valid primitive type: ts_ntz, bool, string, date, int, long,
+    /// decimal, timestamp. Uses [`partitioned_schema`] with all columns as partition columns.
+    AllTypes,
+}
+
+impl DataLayoutConfig {
+    /// The partition column names for this config, referencing [`partitioned_schema`] columns.
+    pub fn columns(&self) -> Vec<&'static str> {
+        match self {
+            DataLayoutConfig::Unpartitioned => vec![],
+            DataLayoutConfig::AllTypes => vec![
+                "part_ts_ntz",
+                "part_bool",
+                "part_string",
+                "part_date",
+                "part_int",
+                "part_long",
+                "part_decimal",
+                "part_ts",
+            ],
+        }
+    }
+}
+
+impl fmt::Display for DataLayoutConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DataLayoutConfig::Unpartitioned => write!(f, "unpartitioned"),
+            DataLayoutConfig::AllTypes => write!(f, "partitioned(all_types)"),
+        }
+    }
+}
+
+/// Schema with all partition-valid primitive types. Use with [`DataLayoutConfig`] to select
+/// which columns are partition columns. Includes `TimestampNtz` which auto-enables the
+/// `timestampNtz` table feature.
+pub fn partitioned_schema() -> SchemaRef {
+    Arc::new(StructType::new_unchecked(vec![
+        // Partition-candidate columns (all valid partition types)
+        StructField::new("part_bool", DataType::BOOLEAN, true),
+        StructField::new("part_int", DataType::INTEGER, true),
+        StructField::new("part_long", DataType::LONG, true),
+        StructField::new("part_string", DataType::STRING, true),
+        StructField::new("part_date", DataType::DATE, true),
+        StructField::new("part_ts", DataType::TIMESTAMP, true),
+        StructField::new("part_ts_ntz", DataType::TIMESTAMP_NTZ, true),
+        StructField::new("part_decimal", DataType::decimal(10, 2).unwrap(), true),
+        // Non-partition data column (required: at least one non-partition column)
+        StructField::new("value", DataType::INTEGER, true),
+    ]))
+}
+
+// ===========================================================================
 // VersionTarget
 // ===========================================================================
 
@@ -190,6 +255,7 @@ pub struct TestTableBuilder {
     log_state: LogState,
     features: FeatureSet,
     schema: SchemaRef,
+    partition_columns: Vec<String>,
     num_data_files: usize,
     rows_per_file: usize,
 }
@@ -208,6 +274,7 @@ impl TestTableBuilder {
             log_state: LogState::with_commits(1),
             features: FeatureSet::empty(),
             schema: default_schema(),
+            partition_columns: Vec::new(),
             num_data_files: 1,
             rows_per_file: 10,
         }
@@ -242,6 +309,23 @@ impl TestTableBuilder {
         self
     }
 
+    /// Set partition columns by logical name. The columns must exist in the schema.
+    /// Each data file gets deterministic partition values derived from version and file index.
+    pub fn partition_columns(mut self, cols: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.partition_columns = cols.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Apply a [`DataLayoutConfig`], setting the schema and partition columns accordingly.
+    /// For [`DataLayoutConfig::Unpartitioned`], leaves the schema and columns unchanged.
+    pub fn data_layout_config(self, config: DataLayoutConfig) -> Self {
+        let cols = config.columns();
+        if cols.is_empty() {
+            return self;
+        }
+        self.schema(partitioned_schema()).partition_columns(cols)
+    }
+
     /// Build the table and return a [`TestTable`] handle to the store.
     ///
     /// Safe to call from both sync tests and `#[tokio::test]` -- uses a dedicated runtime
@@ -274,6 +358,11 @@ impl TestTableBuilder {
                     .map(|(k, v)| (k.as_str(), v.as_str())),
             );
         }
+        if !self.partition_columns.is_empty() {
+            builder = builder.with_data_layout(DataLayout::partitioned(
+                self.partition_columns.iter().map(|s| s.as_str()),
+            ));
+        }
         let committed = builder
             .build(engine.as_ref(), Box::new(FileSystemCommitter::new()))?
             .commit(engine.as_ref())?
@@ -288,6 +377,7 @@ impl TestTableBuilder {
                 &engine,
                 self.num_data_files,
                 self.rows_per_file,
+                &self.partition_columns,
                 v,
             )
             .await?;
@@ -318,6 +408,7 @@ async fn write_data_commit(
     engine: &DefaultEngine<TokioBackgroundExecutor>,
     num_files: usize,
     rows_per_file: usize,
+    partition_columns: &[String],
     version: u64,
 ) -> DeltaResult<delta_kernel::transaction::CommitResult> {
     let logical_schema = snapshot.schema().clone();
@@ -341,8 +432,19 @@ async fn write_data_commit(
         let batch = RecordBatch::try_new(Arc::new(arrow_schema.clone()), columns)
             .map_err(|e| delta_kernel::Error::generic(e.to_string()))?;
 
+        let partition_values = generate_partition_values(
+            logical_schema.as_ref(),
+            partition_columns,
+            version,
+            file_idx,
+        );
+
         let add_files = engine
-            .write_parquet(&ArrowEngineData::new(batch), &write_context, HashMap::new())
+            .write_parquet(
+                &ArrowEngineData::new(batch),
+                &write_context,
+                partition_values,
+            )
             .await?;
         txn.add_files(add_files);
     }
@@ -545,6 +647,107 @@ macro_rules! test_context {
 }
 
 // ===========================================================================
+// Partition value generation
+// ===========================================================================
+
+/// Generate deterministic partition values for a given version and file index.
+/// Follows the Delta protocol partition value serialization format.
+fn generate_partition_values(
+    schema: &StructType,
+    partition_columns: &[String],
+    version: u64,
+    file_idx: usize,
+) -> HashMap<String, String> {
+    let seed = (version as usize) * 1000 + file_idx * 100;
+    partition_columns
+        .iter()
+        .map(|col_name| {
+            let field = schema
+                .field(col_name)
+                .unwrap_or_else(|| panic!("partition column '{col_name}' not in schema"));
+            let value = partition_value_for_type(field.data_type(), seed);
+            (col_name.clone(), value)
+        })
+        .collect()
+}
+
+/// Generate a deterministic partition value string for the given data type, following
+/// the Delta protocol's partition value serialization format.
+fn partition_value_for_type(data_type: &DataType, seed: usize) -> String {
+    use delta_kernel::schema::PrimitiveType;
+    match data_type {
+        DataType::Primitive(p) => match p {
+            PrimitiveType::Boolean => {
+                let even = seed % 2 == 0;
+                format!("{even}")
+            }
+            PrimitiveType::Byte | PrimitiveType::Short | PrimitiveType::Integer => {
+                format!("{}", seed % 100)
+            }
+            PrimitiveType::Long => {
+                format!("{}", seed * 1000)
+            }
+            PrimitiveType::Float => {
+                format!("{:.1}", seed as f32 * 0.5)
+            }
+            PrimitiveType::Double => {
+                format!("{:.2}", seed as f64 * 0.25)
+            }
+            PrimitiveType::String => {
+                format!("part_{seed}")
+            }
+            PrimitiveType::Binary => {
+                format!("bin_{seed}")
+            }
+            PrimitiveType::Date => {
+                // Days since epoch -> YYYY-MM-DD
+                let days = 18000 + seed as i32;
+                let date = chrono::NaiveDate::from_num_days_from_ce_opt(
+                    days + 719_163, // epoch offset
+                )
+                .unwrap_or(chrono::NaiveDate::from_ymd_opt(2020, 1, 1).unwrap());
+                date.format("%Y-%m-%d").to_string()
+            }
+            PrimitiveType::Timestamp => {
+                // Microseconds since epoch -> yyyy-MM-dd HH:mm:ss.SSSSSS
+                let micros = (18000 + seed as i64) * 86_400_000_000;
+                let secs = micros / 1_000_000;
+                let sub_micros = (micros % 1_000_000) as u32;
+                let dt =
+                    chrono::DateTime::from_timestamp(secs, sub_micros * 1000).unwrap_or_default();
+                dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string()
+            }
+            PrimitiveType::TimestampNtz => {
+                let micros = (18000 + seed as i64) * 86_400_000_000;
+                let secs = micros / 1_000_000;
+                let sub_micros = (micros % 1_000_000) as u32;
+                let dt = chrono::DateTime::from_timestamp(secs, sub_micros * 1000)
+                    .unwrap_or_default()
+                    .naive_utc();
+                dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string()
+            }
+            PrimitiveType::Decimal(dt) => {
+                let scale_factor = 10i128.pow(dt.scale() as u32);
+                let value = seed as i128 * scale_factor;
+                format_decimal(value, dt.precision(), dt.scale())
+            }
+        },
+        other => panic!("partition columns must be primitive types, got: {other:?}"),
+    }
+}
+
+/// Format a decimal value as a string with the correct scale.
+fn format_decimal(value: i128, _precision: u8, scale: u8) -> String {
+    if scale == 0 {
+        return value.to_string();
+    }
+    let scale_factor = 10i128.pow(scale as u32);
+    let whole = value / scale_factor;
+    let frac = (value % scale_factor).unsigned_abs();
+    format!("{whole}.{frac:0>width$}", width = scale as usize)
+}
+
+// ===========================================================================
 // Helpers: schema
 // ===========================================================================
 
@@ -624,6 +827,25 @@ mod tests {
         let snap = Snapshot::builder_for(table.table_root()).build(engine.as_ref())?;
         let scan = snap.scan_builder().build()?;
         let batches = crate::read_scan(&scan, engine)?;
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 10);
+        Ok(())
+    }
+
+    #[test]
+    fn test_partitioned_table() -> DeltaResult<()> {
+        let data_layout_config = DataLayoutConfig::AllTypes;
+        let table = TestTableBuilder::new()
+            .log_state(LogState::with_commits(2))
+            .data_layout_config(data_layout_config)
+            .build()?;
+        let engine = table.engine();
+        let snap = Snapshot::builder_for(table.table_root()).build(&engine)?;
+        assert_eq!(snap.version(), 1);
+        let scan = snap.scan_builder().build()?;
+        let engine_arc: Arc<dyn delta_kernel::Engine> =
+            Arc::new(DefaultEngineBuilder::new(table.store().clone()).build());
+        let batches = crate::read_scan(&scan, engine_arc)?;
         let total: usize = batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total, 10);
         Ok(())

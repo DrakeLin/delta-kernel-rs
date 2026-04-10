@@ -300,6 +300,7 @@ impl<E: TaskExecutor> DefaultEngine<E> {
                 physical_data,
                 write_context.physical_partition_values(),
                 Some(write_context.stats_columns()),
+                write_context.path_mode(),
             )
             .await
     }
@@ -318,7 +319,7 @@ pub fn build_add_file_metadata(
     file_metadata: parquet::DataFileMetadata,
     write_context: &WriteContext,
 ) -> DeltaResult<Box<dyn EngineData>> {
-    file_metadata.as_record_batch(write_context.physical_partition_values())
+    file_metadata.as_record_batch(write_context.physical_partition_values(), write_context.path_mode())
 }
 
 impl<E: TaskExecutor> Engine for DefaultEngine<E> {

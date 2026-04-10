@@ -9,6 +9,7 @@ use crate::expressions::{ColumnName, ExpressionRef};
 use crate::partition::hive::build_partition_path;
 use crate::schema::SchemaRef;
 use crate::table_features::ColumnMappingMode;
+use crate::transaction::PathMode;
 
 /// Table-wide write state shared across all [`WriteContext`] instances created by a
 /// [`Transaction`]. Holds the target directory, schemas, column mapping mode, stats columns,
@@ -25,6 +26,8 @@ pub(super) struct SharedWriteState {
     pub(super) stats_columns: Vec<ColumnName>,
     /// Logical partition column names in metadata-defined order.
     pub(super) logical_partition_columns: Vec<String>,
+    /// How file paths should be stored in the Delta log.
+    pub(super) path_mode: PathMode,
 }
 
 /// A write context for a specific partition or an unpartitioned table. Created by
@@ -164,6 +167,16 @@ impl WriteContext {
         build_partition_path(&columns)
     }
 
+    /// Returns the [`PathMode`] that controls how file paths should be stored in the Delta log.
+    ///
+    /// Connectors should use this to determine whether to store relative or absolute paths in the
+    /// add file metadata passed to [`Transaction::add_files`].
+    ///
+    /// [`Transaction::add_files`]: super::Transaction::add_files
+    pub fn path_mode(&self) -> PathMode {
+        self.shared.path_mode
+    }
+
     /// Generate a new unique absolute URL for a deletion vector file.
     ///
     /// This method generates a unique file name in the table directory.
@@ -229,6 +242,7 @@ mod tests {
             column_mapping_mode: cm_mode,
             stats_columns: vec![],
             logical_partition_columns: partition_columns,
+            path_mode: PathMode::default(),
         });
         WriteContext {
             shared,

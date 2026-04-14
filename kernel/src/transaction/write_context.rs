@@ -84,20 +84,32 @@ impl WriteContext {
     /// matching Delta-Spark's per-file behavior.
     // TODO(#2357): respect `delta.randomizeFilePrefixes` and `delta.randomPrefixLength`
     // table properties. Currently random prefixes are only used when column mapping is on.
+    /// Returns the recommended directory for writing Parquet data files. Connectors should
+    /// write files as `<write_dir>/<uuid>.parquet`. Not strictly required (data files can
+    /// live anywhere under the table root), but produces the conventional layout.
+    ///
+    /// ```text
+    ///              | CM OFF                              | CM ON
+    /// -------------|-------------------------------------|-------------------------------
+    /// Unpartitioned| <table_root>/<uuid>.parquet         | <table_root>/<2char>/<uuid>.parquet
+    /// Partitioned  | <table_root>/col=val/.../<uuid>.pq  | <table_root>/<2char>/<uuid>.parquet
+    /// ```
+    ///
+    /// CM ON uses a random 2-char alphanumeric prefix (matching Delta-Spark's
+    /// `getRandomPrefix`) to avoid S3 hotspots. Each call generates a fresh prefix,
+    /// matching Delta-Spark's per-file behavior.
+    // TODO(#2357): respect `delta.randomizeFilePrefixes` and `delta.randomPrefixLength`
+    // table properties. Currently random prefixes are only used when column mapping is on.
     pub fn write_dir(&self) -> Url {
         let mut url = self.shared.table_root.clone();
         match self.shared.column_mapping_mode {
             ColumnMappingMode::None => {
-                // No column mapping: use Hive-style partition directories for partitioned
-                // tables, or just the table root for unpartitioned tables.
                 if !self.shared.logical_partition_columns.is_empty() {
                     let path_suffix = self.hive_partition_path_suffix();
                     url.set_path(&format!("{}{}", url.path(), path_suffix));
                 }
             }
             ColumnMappingMode::Id | ColumnMappingMode::Name => {
-                // Column mapping ON: random 2-char prefix avoids S3 hotspots and avoids
-                // exposing physical UUID column names in Hive-style directory paths.
                 let prefix = random_alphanumeric_prefix();
                 url.set_path(&format!("{}{}/", url.path(), prefix));
             }

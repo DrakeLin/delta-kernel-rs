@@ -1386,7 +1386,7 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
     let engine = Arc::new(engine);
     let write_context = Arc::new(txn.unpartitioned_write_context().unwrap());
 
-    let add_files_metadata = (*engine)
+    let file_metadata = (*engine)
         .parquet_handler()
         .as_any()
         .downcast_ref::<DefaultParquetHandler<TokioBackgroundExecutor>>()
@@ -1394,11 +1394,11 @@ async fn test_append_variant() -> Result<(), Box<dyn std::error::Error>> {
         .write_parquet_file(
             write_context.table_root_dir(),
             Box::new(ArrowEngineData::new(data.clone())),
-            &HashMap::new(),
             Some(write_context.stats_columns()),
-            PathMode::Relative,
         )
         .await?;
+    let add_files_metadata =
+        delta_kernel::engine::default::build_add_file_metadata(file_metadata, &write_context)?;
 
     txn.add_files(add_files_metadata);
 
@@ -1561,7 +1561,7 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
     let engine = Arc::new(engine);
     let write_context = Arc::new(txn.unpartitioned_write_context().unwrap());
 
-    let add_files_metadata = (*engine)
+    let file_metadata = (*engine)
         .parquet_handler()
         .as_any()
         .downcast_ref::<DefaultParquetHandler<TokioBackgroundExecutor>>()
@@ -1569,11 +1569,11 @@ async fn test_shredded_variant_read_rejection() -> Result<(), Box<dyn std::error
         .write_parquet_file(
             write_context.table_root_dir(),
             Box::new(ArrowEngineData::new(data.clone())),
-            &HashMap::new(),
             Some(write_context.stats_columns()),
-            PathMode::Relative,
         )
         .await?;
+    let add_files_metadata =
+        delta_kernel::engine::default::build_add_file_metadata(file_metadata, &write_context)?;
 
     txn.add_files(add_files_metadata);
 

@@ -22,9 +22,10 @@ use super::arrow_expression::ArrowEvaluationHandler;
 use crate::metrics::MetricsReporter;
 use crate::object_store::DynObjectStore;
 use crate::schema::Schema;
-use crate::transaction::WriteContext;
+use crate::transaction::{PathMode, WriteContext};
 use crate::{
-    DeltaResult, Engine, EngineData, EvaluationHandler, JsonHandler, ParquetHandler, StorageHandler,
+    DeltaResult, Engine, EngineData, Error, EvaluationHandler, JsonHandler, ParquetHandler,
+    StorageHandler,
 };
 
 pub mod executor;
@@ -292,22 +293,25 @@ impl<E: TaskExecutor> DefaultEngine<E> {
             output_schema.clone().into(),
         )?;
         let physical_data = logical_to_physical_expr.evaluate(data)?;
-        // Random 2-char prefix for CM tables, Hive-style for partitioned, else table root.
         let write_dir = write_context.write_dir();
-        self.parquet
+        let file_metadata = self
+            .parquet
             .write_parquet_file(
                 &write_dir,
                 physical_data,
-                write_context.physical_partition_values(),
                 Some(write_context.stats_columns()),
-                write_context.path_mode(),
             )
-            .await
+            .await?;
+        build_add_file_metadata(file_metadata, write_context)
     }
 }
 
-/// Converts [`DataFileMetadata`] into Add action [`EngineData`] using the partition values
-/// from the provided [`WriteContext`].
+/// Converts [`DataFileMetadata`] into Add action [`EngineData`] using the partition values,
+/// path mode, and table root from the provided [`WriteContext`].
+///
+/// The path format in the returned Add action metadata (relative vs absolute) is controlled
+/// by [`WriteContext::path_mode`]. Relative paths are computed by stripping the table root
+/// from the file's absolute URL.
 ///
 /// This is the public API for building Add action metadata from file write results. Custom
 /// Arrow-based engines that write parquet files themselves (bypassing [`DefaultEngine::write_parquet`])
@@ -319,7 +323,22 @@ pub fn build_add_file_metadata(
     file_metadata: parquet::DataFileMetadata,
     write_context: &WriteContext,
 ) -> DeltaResult<Box<dyn EngineData>> {
-    file_metadata.as_record_batch(write_context.physical_partition_values(), write_context.path_mode())
+    let log_path = match write_context.path_mode() {
+        PathMode::Relative => file_metadata
+            .location()
+            .path()
+            .strip_prefix(write_context.table_root_dir().path())
+            .ok_or_else(|| {
+                Error::internal_error(format!(
+                    "file '{}' is not under table root '{}'",
+                    file_metadata.location(),
+                    write_context.table_root_dir()
+                ))
+            })?
+            .to_string(),
+        PathMode::Absolute => file_metadata.location().to_string(),
+    };
+    file_metadata.as_record_batch(write_context.physical_partition_values(), &log_path)
 }
 
 impl<E: TaskExecutor> Engine for DefaultEngine<E> {

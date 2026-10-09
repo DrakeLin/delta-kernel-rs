@@ -7,14 +7,16 @@ use std::sync::{Arc, LazyLock};
 
 use delta_kernel_derive::internal_api;
 
+use super::deletion_vector::DeletionVectorDescriptor;
+use super::*;
 use crate::engine_data::{GetData, RowVisitor, TypedGetData as _};
+use crate::log_segment::DomainMetadataMap;
 use crate::schema::{column_name, ColumnName, ColumnNamesAndTypes, DataType, Schema, StructField};
 use crate::utils::require;
 use crate::{DeltaResult, Error};
 
-use super::deletion_vector::DeletionVectorDescriptor;
-use super::*;
-use crate::log_segment::DomainMetadataMap;
+pub(crate) static METADATA_LEAVES: LazyLock<ColumnNamesAndTypes> =
+    LazyLock::new(|| Metadata::to_schema().leaves(METADATA_NAME));
 
 #[derive(Default)]
 #[internal_api]
@@ -24,9 +26,7 @@ pub(crate) struct MetadataVisitor {
 
 impl RowVisitor for MetadataVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
-        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
-            LazyLock::new(|| Metadata::to_schema().leaves(METADATA_NAME));
-        NAMES_AND_TYPES.as_ref()
+        METADATA_LEAVES.as_ref()
     }
 
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
@@ -43,6 +43,7 @@ impl RowVisitor for MetadataVisitor {
 #[derive(Default)]
 pub(crate) struct SelectionVectorVisitor {
     pub(crate) selection_vector: Vec<bool>,
+    pub(crate) num_filtered: u64,
 }
 
 /// A single non-nullable BOOL column
@@ -61,12 +62,18 @@ impl RowVisitor for SelectionVectorVisitor {
             ))
         );
         for i in 0..row_count {
-            self.selection_vector
-                .push(getters[0].get(i, "selectionvector.output")?);
+            let selected: bool = getters[0].get(i, "selectionvector.output")?;
+            if !selected {
+                self.num_filtered += 1;
+            }
+            self.selection_vector.push(selected);
         }
         Ok(())
     }
 }
+
+pub(crate) static PROTOCOL_LEAVES: LazyLock<ColumnNamesAndTypes> =
+    LazyLock::new(|| Protocol::to_schema().leaves(PROTOCOL_NAME));
 
 #[derive(Default)]
 #[internal_api]
@@ -76,9 +83,7 @@ pub(crate) struct ProtocolVisitor {
 
 impl RowVisitor for ProtocolVisitor {
     fn selected_column_names_and_types(&self) -> (&'static [ColumnName], &'static [DataType]) {
-        static NAMES_AND_TYPES: LazyLock<ColumnNamesAndTypes> =
-            LazyLock::new(|| Protocol::to_schema().leaves(PROTOCOL_NAME));
-        NAMES_AND_TYPES.as_ref()
+        PROTOCOL_LEAVES.as_ref()
     }
     fn visit<'a>(&mut self, row_count: usize, getters: &[&'a dyn GetData<'a>]) -> DeltaResult<()> {
         for i in 0..row_count {
@@ -297,24 +302,19 @@ pub(crate) type SetTransactionMap = HashMap<String, SetTransaction>;
 /// `application_id` can be set. This bounds the memory required for the
 /// visitor to at most one entry and reduces the amount of processing
 /// required.
-///
 #[derive(Default, Debug)]
 #[internal_api]
 pub(crate) struct SetTransactionVisitor {
     pub(crate) set_transactions: SetTransactionMap,
     pub(crate) application_id: Option<String>,
-    /// Minimum timestamp for transaction retention. Transactions with last_updated
-    /// older than or equal to this timestamp will be filtered out. None means no filtering.
-    expiration_timestamp: Option<i64>,
 }
 
 impl SetTransactionVisitor {
     /// Create a new visitor. When application_id is set then bookkeeping is only for that id only
-    pub(crate) fn new(application_id: Option<String>, expiration_timestamp: Option<i64>) -> Self {
+    pub(crate) fn new(application_id: Option<String>) -> Self {
         SetTransactionVisitor {
             set_transactions: HashMap::default(),
             application_id,
-            expiration_timestamp,
         }
     }
 
@@ -359,14 +359,6 @@ impl RowVisitor for SetTransactionVisitor {
                     .is_none_or(|requested| requested.eq(&app_id))
                 {
                     let txn = SetTransactionVisitor::visit_txn(i, app_id, getters)?;
-                    // Check retention: filter out transactions that are old
-                    // If last_updated is None, the transaction never expires
-                    match self.expiration_timestamp.zip(txn.last_updated) {
-                        Some((expiration_ts, last_updated)) if last_updated <= expiration_ts => {
-                            continue
-                        }
-                        _ => (),
-                    }
                     if !self.set_transactions.contains_key(&txn.app_id) {
                         self.set_transactions.insert(txn.app_id.clone(), txn);
                     }
@@ -440,7 +432,8 @@ pub(crate) struct DomainMetadataVisitor {
 
 impl DomainMetadataVisitor {
     /// Create a new visitor. When domain_filter is set then we only retain domain metadata for
-    /// domains in the provided set, enabling early termination once all requested domains are found.
+    /// domains in the provided set, enabling early termination once all requested domains are
+    /// found.
     pub(crate) fn new(domain_filter: Option<HashSet<String>>) -> Self {
         DomainMetadataVisitor {
             domain_filter,
@@ -478,9 +471,15 @@ impl DomainMetadataVisitor {
             .is_some_and(|filter| self.domain_metadatas.len() == filter.len())
     }
 
-    pub(crate) fn into_domain_metadatas(mut self) -> DomainMetadataMap {
-        // note that the resulting visitor.domain_metadatas includes removed domains, so we need to filter
-        self.domain_metadatas.retain(|_, dm| !dm.removed);
+    pub(crate) fn into_domain_metadatas(self) -> DomainMetadataMap {
+        let mut domain_metadatas = self.domain_metadatas;
+        domain_metadatas.retain(|_, dm| !dm.removed);
+        domain_metadatas
+    }
+
+    /// The newest-wins domain-metadata map, retaining tombstones (`removed == true`).
+    /// [`Self::into_domain_metadatas`] returns the same map with tombstones stripped.
+    pub(crate) fn into_domain_metadatas_including_tombstones(self) -> DomainMetadataMap {
         self.domain_metadatas
     }
 }
@@ -694,13 +693,14 @@ impl RowVisitor for InCommitTimestampVisitor {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use crate::arrow::array::StringArray;
-
+    use crate::arrow::array::{BooleanArray, StringArray};
+    use crate::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use crate::arrow::record_batch::RecordBatch;
+    use crate::engine::arrow_data::ArrowEngineData;
     use crate::engine::sync::SyncEngine;
     use crate::expressions::{column_expr_ref, Expression};
     use crate::table_features::TableFeature;
-    use crate::utils::test_utils::{action_batch, parse_json_batch};
+    use crate::unit_test_utils::{action_batch, parse_json_batch};
     use crate::Engine;
 
     #[test]
@@ -838,7 +838,7 @@ mod tests {
         };
         let expected = vec![add1, add2, add3];
         assert_eq!(add_visitor.adds.len(), expected.len());
-        for (add, expected) in add_visitor.adds.into_iter().zip(expected.into_iter()) {
+        for (add, expected) in add_visitor.adds.into_iter().zip(expected) {
             assert_eq!(add, expected);
         }
     }
@@ -1243,9 +1243,9 @@ mod tests {
         assert!(visitor.into_domain_metadatas().is_empty());
     }
 
-    /*************************************
-     *  In-commit timestamp visitor tests *
-     **************************************/
+    // ------------------------------------------------------------
+    //  In-commit timestamp visitor tests
+    // ------------------------------------------------------------
 
     fn add_action() -> &'static str {
         r#"{"add":{"path":"file1","partitionValues":{"c1":"6","c2":"a"},"size":452,"modificationTime":1670892998137,"dataChange":true}}"#
@@ -1298,5 +1298,30 @@ mod tests {
             vec![commit_info_action(), add_action()],
             Some(1677811178585), // Retrieved ICT
         );
+    }
+
+    // Helper to create a boolean batch for SelectionVectorVisitor tests
+    fn create_boolean_batch(values: Vec<bool>) -> Box<dyn EngineData> {
+        let array = BooleanArray::from(values);
+        let arrow_schema = ArrowSchema::new(vec![Field::new("output", DataType::Boolean, false)]);
+        let batch = RecordBatch::try_new(Arc::new(arrow_schema), vec![Arc::new(array)]).unwrap();
+        Box::new(ArrowEngineData::new(batch))
+    }
+
+    #[rstest::rstest]
+    #[case::empty_batch(vec![], 0, "empty batch should have no filtered rows")]
+    #[case::all_selected(vec![true, true, true, true], 0, "all selected should have no filtered rows")]
+    #[case::all_filtered(vec![false, false, false, false, false], 5, "all filtered should count all rows")]
+    #[case::mixed_selection(vec![true, false, true, false, false, true], 3, "mixed selection should count false values")]
+    fn selection_vector_visitor_counter_accuracy(
+        #[case] input: Vec<bool>,
+        #[case] expected_filtered: u64,
+        #[case] _description: &str,
+    ) {
+        let batch = create_boolean_batch(input.clone());
+        let mut visitor = SelectionVectorVisitor::default();
+        visitor.visit_rows_of(batch.as_ref()).unwrap();
+        assert_eq!(visitor.selection_vector, input);
+        assert_eq!(visitor.num_filtered, expected_filtered);
     }
 }

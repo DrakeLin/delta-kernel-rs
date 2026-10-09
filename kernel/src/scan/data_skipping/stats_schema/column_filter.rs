@@ -3,11 +3,9 @@
 //! This module contains [`StatsColumnFilter`], which determines which columns
 //! should have statistics collected based on table configuration.
 
-use crate::{
-    column_trie::ColumnTrie,
-    schema::{ColumnName, DataType, Schema, StructField},
-    table_properties::DataSkippingNumIndexedCols,
-};
+use crate::column_trie::ColumnTrie;
+use crate::schema::{ColumnName, DataType, Schema, StructField};
+use crate::table_properties::DataSkippingNumIndexedCols;
 
 /// Configuration for statistics columns
 pub(crate) struct StatsConfig<'a> {
@@ -15,8 +13,8 @@ pub(crate) struct StatsConfig<'a> {
     /// `data_skipping_num_indexed_cols`.
     /// See delta.dataSkippingStatsColumns in the Delta protocol for more details.
     pub(crate) data_skipping_stats_columns: Option<&'a [ColumnName]>,
-    /// Maximum number of leaf columns to include. Ignored when `data_skipping_stats_columns` is set.
-    /// See delta.dataSkippingNumIndexedCols in the Delta protocol for more details.
+    /// Maximum number of leaf columns to include. Ignored when `data_skipping_stats_columns` is
+    /// set. See delta.dataSkippingNumIndexedCols in the Delta protocol for more details.
     pub(crate) data_skipping_num_indexed_cols: Option<DataSkippingNumIndexedCols>,
 }
 
@@ -139,7 +137,7 @@ impl<'col> StatsColumnFilter<'col> {
                     continue;
                 }
                 // Verify the required column exists in schema before adding
-                if schema.walk_column_fields(col).is_ok() {
+                if schema.field_at(col).is_ok() {
                     tracing::warn!(
                         "Required column '{}' exceeds dataSkippingNumIndexedCols limit; \
                          adding anyway",
@@ -170,16 +168,13 @@ impl<'col> StatsColumnFilter<'col> {
     /// Returns true if the current path should be included based on table-level filtering config.
     /// Required columns (e.g. clustering columns) are always included, even past the column limit.
     pub(crate) fn should_include_for_table(&self) -> bool {
-        // When using dataSkippingStatsColumns, check the trie (which includes required)
-        if let Some(trie) = &self.data_skipping_stats_trie {
-            return trie.contains_prefix_of(&self.path);
-        }
-
-        // When using dataSkippingNumIndexedCols, check limit but allow required columns
-        if self.at_column_limit() {
-            self.is_required_column()
-        } else {
-            true
+        match &self.data_skipping_stats_trie {
+            // In explicit dataSkippingStatsColumns mode, include exactly columns selected by the
+            // trie. Required columns are already merged into the trie during
+            // initialization.
+            Some(trie) => trie.contains_prefix_of(&self.path),
+            // In count-based mode, include until limit; required columns can exceed the limit.
+            None => !self.at_column_limit() || self.is_required_column(),
         }
     }
 
@@ -232,8 +227,9 @@ impl<'col> StatsColumnFilter<'col> {
                     self.collect_field(child, result);
                 }
             }
-            // Map, Array, and Variant types are not eligible for statistics collection.
-            DataType::Map(_) | DataType::Array(_) | DataType::Variant(_) => {}
+            // All non-struct types are leaf columns for stats purposes: they count against
+            // the column limit and are included in nullCount. Array, Map, and Variant are
+            // excluded from min/max by MinMaxStatsTransform.
             _ => {
                 if self.should_include_for_table() {
                     result.push(ColumnName::new(&self.path));
@@ -249,7 +245,9 @@ impl<'col> StatsColumnFilter<'col> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{schema::StructType, table_properties::TableProperties};
+    use crate::expressions::column_name;
+    use crate::schema::StructType;
+    use crate::table_properties::TableProperties;
 
     fn make_props_with_num_cols(n: u64) -> TableProperties {
         [(
@@ -361,7 +359,7 @@ mod tests {
         let props = make_props_with_num_cols(2);
 
         // Required column is deeply nested: user.address.city
-        let required_cols = vec![ColumnName::new(["user", "address", "city"])];
+        let required_cols = vec![column_name!("user.address.city")];
 
         let address_struct = StructType::new_unchecked([
             StructField::nullable("street", DataType::STRING),
@@ -370,7 +368,7 @@ mod tests {
         ]);
         let user_struct = StructType::new_unchecked([
             StructField::nullable("name", DataType::STRING),
-            StructField::nullable("address", DataType::Struct(Box::new(address_struct))),
+            StructField::nullable("address", address_struct),
         ]);
         let other_struct = StructType::new_unchecked([
             StructField::nullable("foo", DataType::STRING),
@@ -380,8 +378,8 @@ mod tests {
         let schema = StructType::new_unchecked([
             StructField::nullable("id", DataType::LONG),
             StructField::nullable("name", DataType::STRING),
-            StructField::nullable("user", DataType::Struct(Box::new(user_struct))),
-            StructField::nullable("other", DataType::Struct(Box::new(other_struct))),
+            StructField::nullable("user", user_struct),
+            StructField::nullable("other", other_struct),
             StructField::nullable("extra1", DataType::STRING),
             StructField::nullable("extra2", DataType::STRING),
         ]);
@@ -392,9 +390,9 @@ mod tests {
         assert_eq!(
             columns,
             vec![
-                ColumnName::new(["id"]),
-                ColumnName::new(["name"]),
-                ColumnName::new(["user", "address", "city"]),
+                column_name!("id"),
+                column_name!("name"),
+                column_name!("user.address.city"),
             ]
         );
     }
@@ -403,15 +401,12 @@ mod tests {
     fn test_required_column_not_in_schema() {
         // Required column that doesn't exist in schema should be silently ignored
         let props = make_props_with_num_cols(2);
-        let required_cols = vec![ColumnName::new(["nonexistent", "column"])];
+        let required_cols = vec![column_name!("nonexistent.column")];
         let schema = abc_schema();
 
         let columns = collect_stats_columns(&props, Some(&required_cols), &schema);
 
         // Should only include normal columns, required column not found
-        assert_eq!(
-            columns,
-            vec![ColumnName::new(["a"]), ColumnName::new(["b"]),]
-        );
+        assert_eq!(columns, vec![column_name!("a"), column_name!("b"),]);
     }
 }

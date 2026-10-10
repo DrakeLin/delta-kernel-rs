@@ -29,6 +29,7 @@ use self::executor::TaskExecutor;
 use self::filesystem::ObjectStoreStorageHandler;
 use self::json::DefaultJsonHandler;
 use self::parquet::DefaultParquetHandler;
+use self::storage::EngineStore;
 
 pub mod executor;
 pub mod file_stream;
@@ -210,14 +211,22 @@ pub struct DefaultEngine<E: TaskExecutor> {
 ///     .with_task_executor(Arc::new(TokioBackgroundExecutor::new()))
 ///     .build();
 /// ```
-#[derive(Debug)]
 pub struct DefaultEngineBuilder<E> {
-    object_store: Arc<DynObjectStore>,
+    store: EngineStore,
     /// The state is either [`DefaultTaskExecutor`] or `Arc<E>` with a custom task executor.
     task_executor: E,
     /// Read-path I/O concurrency config applied to the JSON and Parquet handlers. `None` fields
     /// fall back to the handlers' defaults.
     io_config: ReadIoConfig,
+}
+
+impl<E> std::fmt::Debug for DefaultEngineBuilder<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DefaultEngineBuilder")
+            .field("store", &self.store)
+            .field("io_config", &self.io_config)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Read-path I/O tuning for [`DefaultEngine`]'s JSON and Parquet handlers.
@@ -237,10 +246,35 @@ struct ReadIoConfig {
 pub struct DefaultTaskExecutor;
 
 impl DefaultEngineBuilder<DefaultTaskExecutor> {
-    /// Create a new [`DefaultEngineBuilder`] instance with the default executor.
-    pub fn new(object_store: Arc<DynObjectStore>) -> Self {
+    /// Create a new [`DefaultEngineBuilder`] with the default executor.
+    ///
+    /// `store` supplies the engine's object operations and optional paginated listing support.
+    /// Use [`EngineStore::from_url_opts`] or [`EngineStore::from_paginated`] for cloud stores.
+    ///
+    /// # Listing performance
+    ///
+    /// Passing an `Arc<S>` directly selects [`EngineStore::plain`], even when `S` is a concrete
+    /// cloud store that implements paginated listing. The results still exclude nested files,
+    /// but listing collects and sorts the recursive results. Use [`EngineStore::from_ordered`]
+    /// for a globally ordered recursive source to allow streaming and bounded early stopping.
+    /// [`EngineStore::from_paginated`] avoids listing descendants but collects and sorts all pages.
+    /// Use [`EngineStore::from_ordered_paginated`] for a store that guarantees global listing order
+    /// to retain streaming and offset pushdown. [`EngineStore::from_url_opts`] selects this for
+    /// ordered built-in cloud backends automatically.
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use delta_kernel::object_store::aws::AmazonS3Builder;
+    /// # use delta_kernel_default_engine::{storage::EngineStore, DefaultEngineBuilder};
+    /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let store = Arc::new(AmazonS3Builder::from_env().with_bucket_name("bucket").build()?);
+    /// let engine = DefaultEngineBuilder::new(EngineStore::from_ordered_paginated(store)).build();
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn new(store: impl Into<EngineStore>) -> Self {
         Self {
-            object_store,
+            store: store.into(),
             task_executor: DefaultTaskExecutor,
             io_config: ReadIoConfig::default(),
         }
@@ -249,7 +283,7 @@ impl DefaultEngineBuilder<DefaultTaskExecutor> {
     /// Build the [`DefaultEngine`] instance.
     pub fn build(self) -> DefaultEngine<executor::tokio::TokioBackgroundExecutor> {
         let task_executor = Arc::new(executor::tokio::TokioBackgroundExecutor::new());
-        DefaultEngine::new_with_opts(self.object_store, task_executor, self.io_config)
+        DefaultEngine::new_with_opts(self.store, task_executor, self.io_config)
     }
 }
 
@@ -262,7 +296,7 @@ impl<E> DefaultEngineBuilder<E> {
         task_executor: Arc<F>,
     ) -> DefaultEngineBuilder<Arc<F>> {
         DefaultEngineBuilder {
-            object_store: self.object_store,
+            store: self.store,
             task_executor,
             io_config: self.io_config,
         }
@@ -293,7 +327,7 @@ impl<E> DefaultEngineBuilder<E> {
 impl<E: TaskExecutor> DefaultEngineBuilder<Arc<E>> {
     /// Build the [`DefaultEngine`] instance.
     pub fn build(self) -> DefaultEngine<E> {
-        DefaultEngine::new_with_opts(self.object_store, self.task_executor, self.io_config)
+        DefaultEngine::new_with_opts(self.store, self.task_executor, self.io_config)
     }
 }
 
@@ -309,13 +343,16 @@ impl DefaultEngine<executor::tokio::TokioBackgroundExecutor> {
 }
 
 impl<E: TaskExecutor> DefaultEngine<E> {
-    fn new_with_opts(
-        object_store: Arc<DynObjectStore>,
-        task_executor: Arc<E>,
-        io_config: ReadIoConfig,
-    ) -> Self {
+    fn new_with_opts(store: EngineStore, task_executor: Arc<E>, io_config: ReadIoConfig) -> Self {
+        let EngineStore {
+            object_store,
+            paginated,
+            ordered,
+        } = store;
         let raw_storage: Arc<dyn StorageHandler> = Arc::new(ObjectStoreStorageHandler::new(
             object_store.clone(),
+            paginated,
+            ordered,
             task_executor.clone(),
         ));
 

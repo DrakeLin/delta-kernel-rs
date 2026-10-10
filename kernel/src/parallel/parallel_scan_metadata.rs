@@ -1,9 +1,12 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use delta_kernel_derive::internal_api;
 use tracing::{info_span, Span};
 
 use crate::log_replay::{ActionsBatch, ParallelLogReplayProcessor};
+use crate::metrics::events::emit_scan_metadata_completed;
+use crate::metrics::{MetricId, ScanType};
 use crate::parallel::parallel_phase::ParallelPhase;
 use crate::parallel::sequential_phase::{AfterSequential, SequentialPhase};
 use crate::scan::log_replay::{ScanLogReplayProcessor, SerializableScanState};
@@ -31,14 +34,26 @@ pub enum AfterSequentialScanMetadata {
 /// a distributed phase is needed.
 pub struct SequentialScanMetadata {
     pub(crate) sequential: SequentialPhase<ScanLogReplayProcessor>,
+    operation_id: MetricId,
+    /// Opaque, caller-supplied correlation id propagated to both phases' metric events.
+    correlation_id: Option<Arc<str>>,
+    start: Instant,
     span: Span,
 }
 
 impl SequentialScanMetadata {
-    pub(crate) fn new(sequential: SequentialPhase<ScanLogReplayProcessor>) -> Self {
+    pub(crate) fn new(
+        sequential: SequentialPhase<ScanLogReplayProcessor>,
+        correlation_id: Option<Arc<str>>,
+    ) -> Self {
+        let operation_id = MetricId::new();
         Self {
             sequential,
-            // TODO: Associate a unique scan ID with this span to correlate sequential and parallel phases
+            operation_id,
+            correlation_id,
+            start: Instant::now(),
+            // TODO: Associate a unique scan ID with this span to correlate sequential and parallel
+            // phases
             span: info_span!("sequential_scan_metadata"),
         }
     }
@@ -47,20 +62,40 @@ impl SequentialScanMetadata {
         let _guard = self.span.enter();
         match self.sequential.finish()? {
             AfterSequential::Done(processor) => {
+                let event = processor.get_metrics().to_event(
+                    self.operation_id,
+                    processor.is_catalog_managed(),
+                    self.correlation_id,
+                    ScanType::SequentialPhase,
+                    self.start.elapsed(),
+                );
                 processor
                     .get_metrics()
                     .log("Sequential scan metadata completed");
+                emit_scan_metadata_completed(&event);
                 Ok(AfterSequentialScanMetadata::Done)
             }
             AfterSequential::Parallel { processor, files } => {
-                // Log sequential metrics and reset counters for parallel phase
+                let event = processor.get_metrics().to_event(
+                    self.operation_id,
+                    processor.is_catalog_managed(),
+                    self.correlation_id.clone(),
+                    ScanType::SequentialPhase,
+                    self.start.elapsed(),
+                );
                 processor
                     .get_metrics()
                     .log("Sequential scan metadata completed");
+                emit_scan_metadata_completed(&event);
                 processor.get_metrics().reset_counters();
 
                 Ok(AfterSequentialScanMetadata::Parallel {
-                    state: Box::new(ParallelState { inner: processor }),
+                    state: Box::new(ParallelState {
+                        inner: processor,
+                        operation_id: self.operation_id,
+                        correlation_id: self.correlation_id,
+                        parallel_start: Instant::now(),
+                    }),
                     files,
                 })
             }
@@ -83,6 +118,14 @@ impl Iterator for SequentialScanMetadata {
 /// in Arc and shared across threads for local parallel processing.
 pub struct ParallelState {
     inner: ScanLogReplayProcessor,
+    /// Operation ID inherited from the sequential phase for event correlation.
+    operation_id: MetricId,
+    /// Opaque, caller-supplied correlation id inherited from the sequential phase. Does not
+    /// survive the serialization boundary; a reconstructed state carries `None` (tracked in
+    /// #2736).
+    correlation_id: Option<Arc<str>>,
+    /// Start time for the parallel phase, set when this state is created.
+    parallel_start: Instant,
 }
 
 impl ParallelLogReplayProcessor for Arc<ParallelState> {
@@ -115,9 +158,17 @@ impl ParallelState {
     /// }
     /// ```
     pub fn log_metrics(&self) {
+        let event = self.inner.get_metrics().to_event(
+            self.operation_id,
+            self.inner.is_catalog_managed(),
+            self.correlation_id.clone(),
+            ScanType::ParallelPhase,
+            self.parallel_start.elapsed(),
+        );
         self.inner
             .get_metrics()
             .log("Parallel scan metadata completed");
+        emit_scan_metadata_completed(&event);
     }
 
     /// Get the schema to use for reading checkpoint files.
@@ -153,7 +204,14 @@ impl ParallelState {
         state: SerializableScanState,
     ) -> DeltaResult<Self> {
         let inner = ScanLogReplayProcessor::from_serializable_state(engine, state)?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            // Neither operation_id nor correlation_id survive the serialization boundary today; a
+            // reconstructed state starts a fresh operation_id and has no correlation_id (#2736).
+            operation_id: MetricId::new(),
+            correlation_id: None,
+            parallel_start: Instant::now(),
+        })
     }
 
     /// Serialize the processor state directly to bytes.
@@ -208,7 +266,7 @@ impl ParallelScanMetadata {
 
     pub fn new_from_iter(
         state: Arc<ParallelState>,
-        iter: impl IntoIterator<Item = DeltaResult<Box<dyn EngineData>>> + 'static,
+        iter: impl IntoIterator<Item = DeltaResult<Box<dyn EngineData>>, IntoIter: Send + 'static>,
     ) -> Self {
         Self {
             processor: ParallelPhase::new_from_iter(state.clone(), iter),
@@ -224,5 +282,70 @@ impl Iterator for ParallelScanMetadata {
     fn next(&mut self) -> Option<Self::Item> {
         let _guard = self.span.enter();
         self.processor.next()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    use super::ParallelState;
+    use crate::engine::sync::SyncEngine;
+    use crate::log_segment::CheckpointReadInfo;
+    use crate::metrics::{MetricEvent, ScanType, TableType};
+    use crate::scan::log_replay::{
+        ScanLogReplayProcessor, ScanPartitionValuesOptions, ScanStatsOptions,
+    };
+    use crate::scan::state_info::StateInfo;
+    use crate::scan::PhysicalPredicate;
+    use crate::schema::{schema_ref, SchemaRef};
+    use crate::table_features::ColumnMappingMode;
+    use crate::unit_test_utils::{install_thread_local_metrics_reporter, CapturingReporter};
+
+    #[test]
+    fn test_parallel_state_log_metrics_carries_round_tripped_table_type() {
+        let engine = SyncEngine::new();
+        let schema: SchemaRef = schema_ref! {
+            nullable "id": INTEGER,
+        };
+        let state_info = Arc::new(StateInfo {
+            logical_schema: schema.clone(),
+            physical_schema: schema,
+            physical_predicate: PhysicalPredicate::None,
+            transform_spec: None,
+            column_mapping_mode: ColumnMappingMode::None,
+            physical_stats_schema: None,
+            physical_partition_schema: None,
+            eligible_physical_stats_columns: HashSet::new(),
+            requested_physical_stats_columns: Vec::new(),
+            is_catalog_managed: true,
+            skip_row_transforms: false,
+        });
+        let processor = ScanLogReplayProcessor::new(
+            &engine,
+            state_info,
+            CheckpointReadInfo::without_stats_parsed(),
+            ScanStatsOptions::default(),
+            ScanPartitionValuesOptions::default(),
+        )
+        .unwrap();
+        let serialized = processor.into_serializable_state().unwrap();
+        let state = ParallelState::from_serializable_state(&engine, serialized).unwrap();
+
+        let reporter = Arc::new(CapturingReporter::default());
+        let _guard = install_thread_local_metrics_reporter(reporter.clone());
+        state.log_metrics();
+
+        let event = reporter
+            .events()
+            .into_iter()
+            .find_map(|e| match e {
+                MetricEvent::ScanMetadataCompleted(c) => Some(c),
+                _ => None,
+            })
+            .expect("ScanMetadataCompleted emitted");
+        assert_eq!(event.table_type, TableType::CatalogManaged);
+        assert_eq!(event.scan_type, ScanType::ParallelPhase);
     }
 }

@@ -5,23 +5,27 @@ use std::ops::Range;
 
 use tracing::debug;
 
+use crate::actions::visitors::SelectionVectorVisitor;
 use crate::expressions::ArrayData;
 use crate::log_replay::HasSelectionVector;
 use crate::schema::{ColumnName, DataType, SchemaRef};
+use crate::utils::require;
 use crate::{AsAny, DeltaResult, Error};
 
 /// Engine data paired with a selection vector indicating which rows are logically selected.
 ///
-/// A value of `true` in the selection vector means the corresponding row is selected (i.e., not deleted),
-/// while `false` means the row is logically deleted and should be ignored. If the selection vector is shorter
-/// than the number of rows in `data` then all rows not covered by the selection vector are assumed to be selected.
+/// A value of `true` in the selection vector means the corresponding row is selected (i.e., not
+/// deleted), while `false` means the row is logically deleted and should be ignored. If the
+/// selection vector is shorter than the number of rows in `data` then all rows not covered by the
+/// selection vector are assumed to be selected.
 ///
 /// Interpreting unselected (`false`) rows will result in incorrect/undefined behavior.
 pub struct FilteredEngineData {
     // The underlying engine data
     data: Box<dyn EngineData>,
     // The selection vector where `true` marks rows to include in results. N.B. this selection
-    // vector may be less then `data.len()` and any gaps represent rows that are assumed to be selected.
+    // vector may be less then `data.len()` and any gaps represent rows that are assumed to be
+    // selected.
     selection_vector: Vec<bool>,
 }
 
@@ -66,11 +70,10 @@ impl FilteredEngineData {
         }
     }
 
-    /// Apply the contained selection vector and return an engine data with only the valid rows
-    /// included. This consumes the `FilteredEngineData`
+    /// Apply the contained selection vector and return an engine data with only the selected rows
+    /// included. This consumes the `FilteredEngineData`.
     pub fn apply_selection_vector(self) -> DeltaResult<Box<dyn EngineData>> {
-        self.data
-            .apply_selection_vector(self.selection_vector.clone())
+        self.data.apply_selection_vector(self.selection_vector)
     }
 }
 
@@ -192,6 +195,13 @@ impl<'a> MapItem<'a> {
         self.values.is_valid(idx).then(|| self.values.value(idx))
     }
 
+    /// Returns the map's keys in storage order, including keys whose value is null. Unlike
+    /// [`MapItem::materialize`], which drops null-valued entries, this exposes the full key set.
+    pub(crate) fn keys(&self) -> impl Iterator<Item = &'a str> + 'a {
+        let keys = self.keys;
+        self.offsets.clone().map(move |idx| keys.value(idx))
+    }
+
     pub fn materialize(&self) -> HashMap<String, String> {
         let mut ret = HashMap::with_capacity(self.offsets.len());
         for idx in self.offsets.clone() {
@@ -203,6 +213,42 @@ impl<'a> MapItem<'a> {
             }
         }
         ret
+    }
+}
+
+/// Read access to the element structs of an array-of-structs column, abstracting over how the
+/// engine stores them. Backs [`StructList`], mirroring how [`StringArrayAccessor`] backs
+/// [`ListItem`]. Engines implement this for their list column types.
+pub trait StructListAccessor {
+    /// Visits the element structs of the list at `row_index`, one visited row per element.
+    /// Implementations must reject, not skip, a null element struct.
+    fn visit_elems_of_row(
+        &self,
+        row_index: usize,
+        column_names: &[ColumnName],
+        visitor: &mut dyn RowVisitor,
+    ) -> DeltaResult<()>;
+}
+
+/// A handle to a single row's array of element structs. Unlike [`ListItem`], which materializes
+/// strings, the elements are structs visited in place by a nested [`RowVisitor`].
+pub struct StructList<'a> {
+    list: &'a dyn StructListAccessor,
+    row_index: usize,
+}
+
+impl<'a> StructList<'a> {
+    pub fn new(list: &'a dyn StructListAccessor, row_index: usize) -> StructList<'a> {
+        StructList { list, row_index }
+    }
+
+    /// Drives a nested [`RowVisitor`] over this row's element structs, one visited row per
+    /// element. The visitor's columns resolve against the element struct's schema, not the outer
+    /// row's. Errors if any element struct in this row is null.
+    pub fn visit_with(&self, visitor: &mut dyn RowVisitor) -> DeltaResult<()> {
+        let column_names = visitor.selected_column_names_and_types().0;
+        self.list
+            .visit_elems_of_row(self.row_index, column_names, visitor)
     }
 }
 
@@ -222,9 +268,13 @@ macro_rules! impl_default_get {
 /// default all these methods will return an `Error` that an incorrect type has been asked
 /// for. Therefore, for each "data container" an Engine has, it is only necessary to implement the
 /// `get_x` method for the type it holds.
+///
+/// All methods return `Ok(None)` when the row's value is null.
 pub trait GetData<'a> {
     impl_default_get!(
         (get_bool, bool),
+        (get_byte, i8),
+        (get_short, i16),
         (get_int, i32),
         (get_long, i64),
         (get_float, f32),
@@ -235,7 +285,8 @@ pub trait GetData<'a> {
         (get_str, &'a str),
         (get_binary, &'a [u8]),
         (get_list, ListItem<'a>),
-        (get_map, MapItem<'a>)
+        (get_map, MapItem<'a>),
+        (get_struct_list, StructList<'a>)
     );
 }
 
@@ -252,6 +303,8 @@ macro_rules! impl_null_get {
 impl<'a> GetData<'a> for () {
     impl_null_get!(
         (get_bool, bool),
+        (get_byte, i8),
+        (get_short, i16),
         (get_int, i32),
         (get_long, i64),
         (get_float, f32),
@@ -262,7 +315,8 @@ impl<'a> GetData<'a> for () {
         (get_str, &'a str),
         (get_binary, &'a [u8]),
         (get_list, ListItem<'a>),
-        (get_map, MapItem<'a>)
+        (get_map, MapItem<'a>),
+        (get_struct_list, StructList<'a>)
     );
 }
 
@@ -295,6 +349,8 @@ macro_rules! impl_typed_get_data {
 // Use get_date/get_timestamp directly instead of through TypedGetData.
 impl_typed_get_data!(
     (get_bool, bool),
+    (get_byte, i8),
+    (get_short, i16),
     (get_int, i32),
     (get_long, i64),
     (get_float, f32),
@@ -493,7 +549,10 @@ pub trait RowVisitor {
 ///     todo!() // convert `SchemaRef` and `ArrayData` into local representation and append them
 ///   }
 ///   fn apply_selection_vector(self: Box<Self>, selection_vector: Vec<bool>) -> DeltaResult<Box<dyn EngineData>> {
-///     todo!() // filter out unselected rows and return the new set of data
+///     todo!() // filter out unselected rows; rows beyond the selection vector's end are selected
+///   }
+///   fn has_field(&self, name: &ColumnName) -> bool {
+///     todo!() // determine whether the field exists in the data
 ///   }
 /// }
 /// ```
@@ -501,6 +560,9 @@ pub trait EngineData: AsAny {
     /// Visits a subset of leaf columns in each row of this data, passing a `GetData` item for each
     /// requested column to the visitor's `visit` method (along with the number of rows of data to
     /// be visited).
+    ///
+    /// Implementations must invoke [`RowVisitor::visit`] exactly once. `row_count` must equal
+    /// [`EngineData::len`], and every getter must support the same `0..row_count` row range.
     fn visit_rows(
         &self,
         column_names: &[ColumnName],
@@ -521,9 +583,10 @@ pub trait EngineData: AsAny {
     /// with the provided new columns. The original data remains unchanged.
     ///
     /// # Parameters
-    /// - `schema`: The schema of the columns being appended (not the entire resulting schema).
-    ///   This schema must describe exactly the columns being added in the `columns` parameter.
-    /// - `columns`: The column data to append. Each [`ArrayData`] corresponds to one field in the schema.
+    /// - `schema`: The schema of the columns being appended (not the entire resulting schema). This
+    ///   schema must describe exactly the columns being added in the `columns` parameter.
+    /// - `columns`: The column data to append. Each [`ArrayData`] corresponds to one field in the
+    ///   schema.
     ///
     /// # Returns
     /// A new `EngineData` instance containing both the original columns and the appended columns.
@@ -541,25 +604,58 @@ pub trait EngineData: AsAny {
         columns: Vec<ArrayData>,
     ) -> DeltaResult<Box<dyn EngineData>>;
 
-    /// Apply a selection vector to the data and return a data where only the valid rows are
+    /// Apply a selection vector to the data and return a data where only the selected rows are
     /// included. This consumes the EngineData, allowing engines to implement this "in place" if
-    /// desired
+    /// desired.
+    ///
+    /// The selection vector may be shorter than the data; rows beyond its end are selected and
+    /// must be retained (see [`FilteredEngineData`]). An empty selection vector selects all rows.
+    /// A selection vector longer than the data is invalid and must be rejected, e.g. with
+    /// [`Error::InvalidSelectionVector`].
     fn apply_selection_vector(
         self: Box<Self>,
         selection_vector: Vec<bool>,
     ) -> DeltaResult<Box<dyn EngineData>>;
+
+    /// Returns `true` if a field at the given (possibly nested) path exists in this data's schema.
+    ///
+    /// For a top-level field named `"foo"`, use `column_name!("foo")`. For nested fields,
+    /// each non-leaf element of the path must be a struct field at that level.
+    fn has_field(&self, name: &ColumnName) -> bool;
+}
+
+/// Evaluates a predicate on the batch, extracts the resulting selection vector, and applies
+/// it to filter out rows that don't satisfy the predicate.
+pub(crate) fn filter_by_predicate(
+    filter: &dyn crate::PredicateEvaluator,
+    batch: Box<dyn EngineData>,
+) -> DeltaResult<Box<dyn EngineData>> {
+    let predicate_result = filter.evaluate(batch.as_ref())?;
+    let mut visitor = SelectionVectorVisitor::default();
+    visitor.visit_rows_of(predicate_result.as_ref())?;
+    require!(
+        visitor.selection_vector.len() == batch.len(),
+        Error::internal_error(format!(
+            "predicate output length {} != batch length {}",
+            visitor.selection_vector.len(),
+            batch.len()
+        ))
+    );
+    batch.apply_selection_vector(visitor.selection_vector)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use rstest::rstest;
+
     use super::*;
     use crate::arrow::array::{RecordBatch, StringArray};
     use crate::arrow::datatypes::{
         DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema,
     };
     use crate::engine::arrow_data::ArrowEngineData;
-    use rstest::rstest;
-    use std::sync::Arc;
 
     fn get_engine_data(rows: usize) -> Box<dyn EngineData> {
         let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
@@ -790,5 +886,33 @@ mod tests {
         #[case] expected: Vec<usize>,
     ) {
         assert_eq!(collect_indices(row_count, selection), expected);
+    }
+
+    #[test]
+    fn map_item_keys_includes_null_valued_keys() {
+        // Map { "a" => "1", "b" => null }: `keys()` must expose both keys, while `materialize()`
+        // (and `get`) drop the null-valued entry.
+        let keys = StringArray::from(vec!["a", "b"]);
+        let values = StringArray::from(vec![Some("1"), None]);
+        let map = MapItem::new(&keys, &values, 0..2);
+
+        let mut seen: Vec<&str> = map.keys().collect();
+        seen.sort_unstable();
+        assert_eq!(seen, vec!["a", "b"]);
+
+        assert_eq!(map.get("a"), Some("1"));
+        assert_eq!(map.get("b"), None);
+        assert_eq!(
+            map.materialize(),
+            HashMap::from([("a".to_string(), "1".to_string())])
+        );
+    }
+
+    #[test]
+    fn map_item_keys_empty() {
+        let keys = StringArray::from(Vec::<&str>::new());
+        let values = StringArray::from(Vec::<&str>::new());
+        let map = MapItem::new(&keys, &values, 0..0);
+        assert_eq!(map.keys().count(), 0);
     }
 }

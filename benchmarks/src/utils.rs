@@ -1,7 +1,8 @@
 //! Utility functions for loading workload specifications
 
-use crate::models::{Spec, TableInfo, Workload};
 use std::path::{Path, PathBuf};
+
+use delta_kernel_workloads::models::{Spec, TableInfo, Workload};
 
 // Environment variable used to filter benchmarks by tag (e.g. `BENCH_TAGS=base,feature_x`).
 pub const BENCH_TAGS_ENV_VAR: &str = "BENCH_TAGS";
@@ -14,21 +15,29 @@ const DELTA_DIR_NAME: &str = "delta";
 
 /// Loads all workload specifications from `OUTPUT_FOLDER`, optionally filtered by `BENCH_TAGS`.
 ///
+/// If `KERNEL_BENCH_WORKLOAD_DIR` is set, loads from that directory instead (for remote/S3 tables).
+///
 /// Workloads are downloaded and extracted into `OUTPUT_FOLDER` at build time by `build.rs`.
 ///
 /// If the `BENCH_TAGS` environment variable is set (e.g. `BENCH_TAGS=base`),
 /// only workloads whose `table_info.json` has at least one matching tag are returned.
 /// If `BENCH_TAGS` is unset or empty, all workloads are returned.
 pub fn load_all_workloads() -> Result<Vec<Workload>, Box<dyn std::error::Error>> {
-    let spec_dir = PathBuf::from(OUTPUT_FOLDER);
-    let benchmarks_dir = spec_dir.join(BENCHMARKS_DIR_NAME);
-    let table_directories = find_table_directories(&benchmarks_dir)?;
+    // When KERNEL_BENCH_WORKLOAD_DIR is set, tag filtering is skipped -- remote workload
+    // directories are assumed to be curated, so all tables in the directory are benchmarked.
+    let (base_dir, required_tags) = if let Ok(dir) = std::env::var("KERNEL_BENCH_WORKLOAD_DIR") {
+        (PathBuf::from(dir), None)
+    } else {
+        let benchmarks_dir = PathBuf::from(OUTPUT_FOLDER).join(BENCHMARKS_DIR_NAME);
+        (benchmarks_dir, get_required_tags())
+    };
 
-    let required_tags = get_required_tags();
+    let table_directories = find_table_directories(&base_dir)?;
+
     let mut all_workloads = Vec::new();
 
     for table_dir in table_directories {
-        all_workloads.extend(load_specs_from_table(&table_dir, required_tags.as_ref())?);
+        all_workloads.extend(load_specs_from_table(&table_dir, required_tags.as_deref())?);
     }
 
     Ok(all_workloads)
@@ -43,8 +52,9 @@ fn get_required_tags() -> Option<Vec<String>> {
         .map(|s| s.split(',').map(|t| t.trim().to_string()).collect())
 }
 
-/// Returns all subdirectories of `base_dir`. In practice this is called with `base_dir` = `OUTPUT_FOLDER`/`BENCHMARKS_DIR_NAME`,
-/// Each subdirectory returned represents a table to be benchmarked and contains the table itself, specs, and table info
+/// Returns all subdirectories of `base_dir`. In practice this is called with `base_dir` =
+/// `OUTPUT_FOLDER`/`BENCHMARKS_DIR_NAME`, Each subdirectory returned represents a table to be
+/// benchmarked and contains the table itself, specs, and table info
 fn find_table_directories(base_dir: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
     let entries = std::fs::read_dir(base_dir)
         .map_err(|e| format!("Cannot read directory {}: {}", base_dir.display(), e))?;
@@ -68,11 +78,12 @@ fn find_table_directories(base_dir: &Path) -> Result<Vec<PathBuf>, Box<dyn std::
 /// Reads table info from `TABLE_INFO_FILE_NAME` at the root of `table_dir`,
 /// then loads each JSON spec from `table_dir`/`SPECS_DIR_NAME`.
 ///
-/// If `required_tags` is `None`, all tables are included (no tables will be skipped in this function)
-/// Otherwise, a specific table is included (not skipped by this function) if any of its tags appear in `required_tags` (uses union semantics)
+/// If `required_tags` is `None`, all tables are included (no tables will be skipped in this
+/// function) Otherwise, a specific table is included (not skipped by this function) if any of its
+/// tags appear in `required_tags` (uses union semantics)
 fn load_specs_from_table(
     table_dir: &Path,
-    required_tags: Option<&Vec<String>>,
+    required_tags: Option<&[String]>,
 ) -> Result<Vec<Workload>, Box<dyn std::error::Error>> {
     let specs_dir = table_dir.join(SPECS_DIR_NAME);
 
@@ -96,17 +107,26 @@ fn load_specs_from_table(
         }
     }
 
-    // If the table path is not provided, assume that the Delta table is in a DELTA_DIR_NAME/ subdirectory at the same level as table_info.json
-    if table_info.table_path.is_none() {
+    // Remote tables (table_path or catalog_info present) don't need local data.
+    // Local tables must have a delta/ subdirectory next to tableInfo.json.
+    let is_remote = table_info.table_path.is_some() || table_info.catalog_info.is_some();
+    if !is_remote {
         let delta_dir = table_dir.join(DELTA_DIR_NAME);
         if !delta_dir.is_dir() {
             return Err(format!(
-                "Table data not found for '{}'. Expected a 'delta' directory in {}",
-                table_info.name,
+                "Table data not found. Expected a 'delta' directory in {}",
                 table_dir.display()
             )
             .into());
         }
+    }
+
+    if table_info.registry_table_key().is_none() {
+        return Err(format!(
+            "could not derive table name from directory {}",
+            table_dir.display()
+        )
+        .into());
     }
 
     let spec_files = find_spec_files(&specs_dir)?;
@@ -165,7 +185,8 @@ mod tests {
 
     #[test]
     fn test_get_required_tags() {
-        // These cases must run sequentially b/c env vars conflict when these tests are separate (as they run in parallel)
+        // These cases must run sequentially b/c env vars conflict when these tests are separate (as
+        // they run in parallel)
         std::env::remove_var(BENCH_TAGS_ENV_VAR);
         assert!(get_required_tags().is_none());
 
@@ -185,5 +206,41 @@ mod tests {
         assert_eq!(get_required_tags().unwrap(), vec!["ci", "checkpoints"]);
 
         std::env::remove_var(BENCH_TAGS_ENV_VAR);
+    }
+
+    #[test]
+    fn load_specs_from_table_uses_directory_basename_not_table_info_name() {
+        // A remote `tablePath` skips the local `delta/` requirement, so only `tableInfo.json` and
+        // `specs/` are needed.
+        let root = tempfile::tempdir().unwrap();
+        let table_dir = root.path().join("dirBasename");
+        std::fs::create_dir_all(table_dir.join(SPECS_DIR_NAME)).unwrap();
+        std::fs::write(
+            table_dir.join(TABLE_INFO_FILE_NAME),
+            r#"{
+                "name": "humanLabel", "description": "d", "tablePath": "s3://b/t",
+                "schema": {"type": "struct", "fields": []},
+                "protocol": {"minReaderVersion": 1, "minWriterVersion": 2},
+                "logInfo": {"numAddFiles": 0, "numRemoveFiles": 0, "sizeInBytes": 0, "numCommits": 1, "numActions": 1},
+                "properties": {}, "dataLayout": {}, "tags": []
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            table_dir
+                .join(SPECS_DIR_NAME)
+                .join("readMetadataLatest.json"),
+            r#"{"type": "read"}"#,
+        )
+        .unwrap();
+
+        let workloads = load_specs_from_table(&table_dir, None).unwrap();
+        assert_eq!(workloads.len(), 1);
+        assert_eq!(
+            workloads[0].table_info.registry_table_key(),
+            Some("dirBasename")
+        );
+        assert_eq!(workloads[0].table_info.name, "humanLabel");
+        assert_eq!(workloads[0].case_name, "readMetadataLatest");
     }
 }

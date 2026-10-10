@@ -3,23 +3,19 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-use crate::actions::deletion_vector::deletion_treemap_to_bools;
-use crate::scan::get_transform_for_row;
-use crate::schema::Schema;
-use crate::utils::require;
-use crate::ExpressionRef;
-use crate::{
-    actions::{deletion_vector::DeletionVectorDescriptor, visitors::visit_deletion_vector_at},
-    engine_data::{FilteredRowVisitor, GetData, RowIndexIterator, TypedGetData},
-    schema::{ColumnName, ColumnNamesAndTypes, DataType, SchemaRef},
-    DeltaResult, Engine, EngineData, Error,
-};
 use roaring::RoaringTreemap;
 use serde::Deserialize;
 use tracing::warn;
 
 use super::log_replay::SCAN_ROW_SCHEMA;
 use super::ScanMetadata;
+use crate::actions::deletion_vector::{deletion_treemap_to_bools, DeletionVectorDescriptor};
+use crate::actions::visitors::visit_deletion_vector_at;
+use crate::engine_data::{FilteredRowVisitor, GetData, RowIndexIterator, TypedGetData};
+use crate::scan::get_transform_for_row;
+use crate::schema::{ColumnName, ColumnNamesAndTypes, DataType, Schema, SchemaRef};
+use crate::utils::require;
+use crate::{DeltaResult, Engine, EngineData, Error, ExpressionRef};
 
 /// this struct can be used by an engine to materialize a selection vector
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
@@ -126,8 +122,8 @@ pub struct ScanFile {
     pub stats: Option<Stats>,
     /// A [`DvInfo`] struct, which allows getting the selection vector for this file
     pub dv_info: DvInfo,
-    /// An optional expression that, if present, _must_ be applied to physical data to convert it to
-    /// the correct logical format
+    /// An optional expression that, if present, _must_ be applied to physical data to convert it
+    /// to the correct logical format
     pub transform: Option<ExpressionRef>,
     /// a `HashMap<String, String>` which map partition names to the value they have in this file
     pub partition_values: HashMap<String, String>,
@@ -234,9 +230,9 @@ impl<T> FilteredRowVisitor for ScanFileVisitor<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    use crate::actions::get_commit_schema;
     use crate::scan::state::ScanFile;
     use crate::scan::test_utils::{add_batch_simple, run_with_validate_callback};
+    use crate::scan::COMMIT_READ_SCHEMA;
 
     #[derive(Clone)]
     struct TestContext {
@@ -268,7 +264,7 @@ mod tests {
     fn test_simple_visit_scan_metadata() {
         let context = TestContext { id: 2 };
         run_with_validate_callback(
-            vec![add_batch_simple(get_commit_schema().clone())],
+            vec![add_batch_simple(COMMIT_READ_SCHEMA.clone())],
             None, // not testing schema
             None, // not testing transform
             &[true, false],
